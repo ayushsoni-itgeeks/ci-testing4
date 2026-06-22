@@ -1,7 +1,10 @@
 # CI gate for pull requests into main.
-# Four stages run in order (secrets → deps → static → tests); a critical
-# finding stops the chain. The final "gate" job publishes one required status
-# check — "CI Gate · Feature → Main" — that protect-main.json requires to merge.
+# Five stages run in order (secrets → deps → static → tests → build); the first
+# blocking finding stops the chain and every later stage is skipped. Each stage
+# publishes its OWN report (job summary + inline annotations) in the UI. The
+# final "gate" job does NOT re-report — it only publishes the single required
+# status check ("CI Gate · Feature → Main", required by protect-main.json) and,
+# on failure, files a GitHub issue with the detailed findings.
 # Edit only the env block below.
 
 name: "PR to main"
@@ -20,7 +23,7 @@ permissions:
 
 env:
   NODE_VERSION: "20"                                 # match package.json engines.node
-  VITEST_CMD:   "npx vitest run --reporter=verbose"  # your test command
+  VITEST_CMD:   "npx vitest run --reporter=verbose --passWithNoTests"  # your test command
   BUILD_CMD:    "npm run build"                      # your production build command
   USE_PRISMA:   "true"                               # run prisma generate before building
   SKIP_TESTS:   ${{ vars.SKIP_TESTS || 'false' }}    # repo var SKIP_TESTS=true skips stage 4
@@ -53,6 +56,12 @@ jobs:
             env-committed.txt
             private-keys-detail.tsv
             private-key-content.txt
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 1 · Secrets & Credentials"
 
   # Stage 2 — dependency vulns (npm audit + Trivy). Runs only if stage 1 is clean.
   stage-2-deps:
@@ -96,6 +105,12 @@ jobs:
             trivy-report.json
             trivy-report.sarif
 
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 2 · Dependencies & Vulnerabilities"
+
   # Stage 3 — static analysis (ESLint + tsc + Prettier). Runs only if deps are clean.
   stage-3-static:
     name: "Stage 3 · Static Code Analysis"
@@ -112,8 +127,23 @@ jobs:
       eslint_warnings: ${{ steps.static.outputs.eslint_warnings }}
       ts_errors:       ${{ steps.static.outputs.ts_errors }}
       prettier_issues: ${{ steps.static.outputs.prettier_issues }}
+      has_tests:       ${{ steps.detect-tests.outputs.has_tests }}
     steps:
       - uses: actions/checkout@v4
+
+      # Decide up front whether Stage 4 should run: if the repo has no Vitest
+      # test files, Stage 4 is skipped entirely (rather than running Vitest,
+      # which errors with "No test files found").
+      - name: Detect test files
+        id: detect-tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          COUNT=$(git ls-files | grep -icE '(^|/)[^/]+\.(test|spec)\.([cm]?[jt]sx?)$|(^|/)__tests__/' || true)
+          COUNT=${COUNT:-0}
+          if [ "$COUNT" -gt 0 ]; then HAS=true; else HAS=false; fi
+          echo "has_tests=$HAS" >> "$GITHUB_OUTPUT"
+          echo "Detected $COUNT test file(s) → has_tests=$HAS"
 
       - name: Setup Node & install
         uses: ./.github/actions/setup-node
@@ -136,11 +166,21 @@ jobs:
             tsc.log
             prettier.log
 
-  # Stage 4 — Vitest. Runs only if static is clean and SKIP_TESTS isn't set.
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 3 · Static Code Analysis"
+
+  # Stage 4 — Vitest. Runs only if static is clean, SKIP_TESTS isn't set, AND the
+  # repo actually contains test files (detected in Stage 3). No tests → skipped.
   stage-4-tests:
     name: "Stage 4 · Unit Tests (Vitest)"
     needs: stage-3-static
-    if: needs.stage-3-static.outputs.critical == '0' && vars.SKIP_TESTS != 'true'
+    if: >
+      needs.stage-3-static.outputs.critical == '0' &&
+      vars.SKIP_TESTS != 'true' &&
+      needs.stage-3-static.outputs.has_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -170,15 +210,26 @@ jobs:
             vitest-results.json
             vitest.log
 
-  # Stage 5 — production build. Runs only when static is clean and tests aren't
-  # failing (a skipped test stage is fine). Catches build-time breakage that
-  # tsc --noEmit can't (bundler config, build-only imports, etc.).
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 4 · Unit Tests (Vitest)"
+
+  # Stage 5 — production build. Runs only when every earlier stage actually
+  # succeeded: static analysis clean (no critical findings) and the test stage
+  # either passed or was intentionally skipped (SKIP_TESTS). If any earlier
+  # stage failed, crashed, or found a blocking issue, the build is SKIPPED —
+  # the pipeline stops and goes straight to the gate (which files the issue).
+  # Catches build-time breakage tsc --noEmit can't (bundler config, etc.).
   stage-5-build:
     name: "Stage 5 · Production Build"
     needs: [stage-3-static, stage-4-tests]
     if: >
-      always() &&
+      !cancelled() &&
+      needs.stage-3-static.result == 'success' &&
       needs.stage-3-static.outputs.critical == '0' &&
+      (needs.stage-4-tests.result == 'success' || needs.stage-4-tests.result == 'skipped') &&
       needs.stage-4-tests.outputs.tests_passed != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -206,6 +257,12 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
           path: build.log
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 5 · Production Build"
 
   # Gate — the single required status check. Aggregates every stage and decides.
   gate:
@@ -267,11 +324,12 @@ jobs:
           skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
           build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
 
-      # Parse the downloaded stage reports into a detailed, professional findings
-      # document (file / line / column / commit / message per finding). This file
-      # becomes the body of the auto-filed GitHub issue. Always runs so the body
-      # is available even when the gate decision step fails the job.
-      - name: Build issue findings report
+      # Parse the downloaded stage reports into a detailed findings document
+      # (file / line / column / commit / message per finding) for the auto-filed
+      # GitHub issue ONLY. Always runs so the issue body is available even when
+      # the gate decision step fails the job. This does NOT write a job summary
+      # (each stage already published its own report) and does NOT run the build.
+      - name: Collect detailed findings (issue body)
         if: always()
         shell: bash
         env:
@@ -378,6 +436,10 @@ jobs:
             if [ -s "$R/build.log" ]; then grep -E '(error|Error|ERROR)' "$R/build.log" 2>/dev/null | grep -v '^npm warn' | tail -40 | sed 's/\r//' >> "$OUT" || true; else echo "(build.log not available)" >> "$OUT"; fi
             { echo '```'; echo ""; } >> "$OUT"
           fi
+
+          # NOTE: the detailed findings are intentionally NOT mirrored into the
+          # job summary — each stage already published its own report in the UI,
+          # and the gate must not duplicate it. This document feeds the issue only.
 
           if [ ! -s "$OUT" ]; then
             echo "No detailed findings were captured. See the workflow run logs and the Annotations tab on the pull request." > "$OUT"
@@ -487,36 +549,18 @@ jobs:
                 : (reasons || '- A pipeline stage failed to complete (infrastructure or setup error). Open the workflow run log.');
 
               const body = [
-                `## Continuous integration failure`,
-                ``,
-                `The automated CI gate blocked this pull request. The findings below must be resolved on the source branch before the pull request can be merged.`,
+                `## CI failure`,
                 ``,
                 `| Field | Value |`,
                 `| --- | --- |`,
                 `| Pull request | #${prNumber} |`,
-                `| Source branch | \`${headRef}\` |`,
-                `| Target branch | \`main\` |`,
+                `| Branch | \`${headRef}\` into \`main\` |`,
                 `| Commit | \`${sha7}\` |`,
                 `| Workflow run | [run #${context.runId}](${runUrl}) |`,
                 ``,
-                `## Findings`,
+                `## Findings (problem · commit · line)`,
                 ``,
                 detail,
-                ``,
-                `## How to resolve`,
-                ``,
-                `1. Review each finding above. The same errors are also shown inline on the pull request diff via the Annotations tab.`,
-                `2. Fix every blocking item on the \`${headRef}\` branch.`,
-                `3. Push the changes. The pipeline re-runs automatically and this issue is updated with the latest results.`,
-                `4. When the pipeline passes, this issue is closed automatically.`,
-                ``,
-                `## Reference`,
-                ``,
-                `- Workflow run logs: ${runUrl}`,
-                `- CI gate definition: \`.github/workflows/pr-to-main.yml\``,
-                ``,
-                `---`,
-                `<sub>Filed automatically by the CI gate. Updated on each failing push and closed automatically when the pipeline passes. Do not remove the marker below.</sub>`,
                 ``,
                 marker,
               ].join('\n');

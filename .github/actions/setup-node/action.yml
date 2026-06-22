@@ -20,7 +20,13 @@ runs:
         node-version: ${{ inputs.node-version }}
         cache: "npm"
 
+    # Tee the install output to npm-ci.log so that if `npm ci` fails (the most
+    # common stage failure), the stage-failure report can surface the error in
+    # the job summary instead of the job dying silently. pipefail preserves the
+    # npm ci exit code, so a real failure still fails the step (and the job).
     - name: Install dependencies
       if: inputs.install == 'true'
       shell: bash
-      run: npm ci
+      run: |
+        set -uo pipefail
+        npm ci 2>&1 | tee npm-ci.log
