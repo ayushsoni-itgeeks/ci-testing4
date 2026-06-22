@@ -23,7 +23,7 @@ permissions:
 
 env:
   NODE_VERSION: "20"                                 # match package.json engines.node
-  VITEST_CMD:   "npx vitest run --reporter=verbose"  # your test command
+  VITEST_CMD:   "npx vitest run --reporter=verbose --passWithNoTests"  # your test command
   BUILD_CMD:    "npm run build"                      # your production build command
   USE_PRISMA:   "true"                               # run prisma generate before building
   SKIP_TESTS:   ${{ vars.SKIP_TESTS || 'false' }}    # repo var SKIP_TESTS=true skips stage 4
@@ -115,8 +115,23 @@ jobs:
       eslint_warnings: ${{ steps.static.outputs.eslint_warnings }}
       ts_errors:       ${{ steps.static.outputs.ts_errors }}
       prettier_issues: ${{ steps.static.outputs.prettier_issues }}
+      has_tests:       ${{ steps.detect-tests.outputs.has_tests }}
     steps:
       - uses: actions/checkout@v4
+
+      # Decide up front whether Stage 4 should run: if the repo has no Vitest
+      # test files, Stage 4 is skipped entirely (rather than running Vitest,
+      # which errors with "No test files found").
+      - name: Detect test files
+        id: detect-tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          COUNT=$(git ls-files | grep -icE '(^|/)[^/]+\.(test|spec)\.([cm]?[jt]sx?)$|(^|/)__tests__/' || true)
+          COUNT=${COUNT:-0}
+          if [ "$COUNT" -gt 0 ]; then HAS=true; else HAS=false; fi
+          echo "has_tests=$HAS" >> "$GITHUB_OUTPUT"
+          echo "Detected $COUNT test file(s) → has_tests=$HAS"
 
       - name: Setup Node & install
         uses: ./.github/actions/setup-node
@@ -139,11 +154,15 @@ jobs:
             tsc.log
             prettier.log
 
-  # Stage 4 — Vitest. Runs only if static is clean and SKIP_TESTS isn't set.
+  # Stage 4 — Vitest. Runs only if static is clean, SKIP_TESTS isn't set, AND the
+  # repo actually contains test files (detected in Stage 3). No tests → skipped.
   stage-4-tests:
     name: "Stage 4 · Unit Tests (Vitest)"
     needs: stage-3-static
-    if: needs.stage-3-static.outputs.critical == '0' && vars.SKIP_TESTS != 'true'
+    if: >
+      needs.stage-3-static.outputs.critical == '0' &&
+      vars.SKIP_TESTS != 'true' &&
+      needs.stage-3-static.outputs.has_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:

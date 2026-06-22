@@ -63,9 +63,12 @@ runs:
           INFO=$(jq '.metadata.vulnerabilities.info // 0'     npm-audit.json 2>/dev/null || echo 0)
         fi
 
+        # Outdated = only packages with a genuinely newer version available
+        # (wanted != latest). Packages already on the newest version are not
+        # outdated and would just be noise.
         OUTDATED=0
         if [ -s npm-outdated.json ]; then
-          OUTDATED=$(jq 'keys | length' npm-outdated.json 2>/dev/null || echo 0)
+          OUTDATED=$(jq '[to_entries[] | select(.value.wanted != .value.latest)] | length' npm-outdated.json 2>/dev/null || echo 0)
         fi
 
         DEPRECATED=0
@@ -118,7 +121,7 @@ runs:
           MOD=$( jq '.metadata.vulnerabilities.moderate // 0' npm-audit.json 2>/dev/null || echo 0)
           LOW=$( jq '.metadata.vulnerabilities.low      // 0' npm-audit.json 2>/dev/null || echo 0)
         fi
-        OUTDATED=$(jq 'keys | length' npm-outdated.json 2>/dev/null || echo 0)
+        OUTDATED=$(jq '[to_entries[] | select(.value.wanted != .value.latest)] | length' npm-outdated.json 2>/dev/null || echo 0)
         DEPR=$(wc -l < deprecated.txt 2>/dev/null | tr -d ' '); DEPR=${DEPR:-0}
 
         {
@@ -155,7 +158,7 @@ runs:
             echo "#### Outdated Packages"
             echo "| Package | Current | Wanted | Latest |"
             echo "|:--------|:--------|:-------|:-------|"
-            jq -r 'to_entries[] | "| `" + .key + "` | " + (.value.current // "?") +
+            jq -r 'to_entries[] | select(.value.wanted != .value.latest) | "| `" + .key + "` | " + (.value.current // "?") +
               " | " + (.value.wanted // "?") + " | " + (.value.latest // "?") + " |"' \
               npm-outdated.json 2>/dev/null | head -20 || true
           fi
