@@ -214,6 +214,9 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      blocked: ${{ steps.gate.outputs.blocked }}
+      reasons: ${{ steps.gate.outputs.reasons }}
     steps:
       - uses: actions/checkout@v4
 
@@ -240,6 +243,7 @@ jobs:
           path: reports
 
       - name: Report & gate decision
+        id: gate
         uses: ./.github/actions/ci-gate
         with:
           pr_number:       ${{ github.event.pull_request.number }}
@@ -261,3 +265,116 @@ jobs:
           test_failures:   ${{ needs.stage-4-tests.outputs.test_failures }}
           skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
           build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
+
+  # Auto-file a GitHub Issue when the gate blocks the PR.
+  # One issue per PR: updated on each failing re-push and auto-closed once the
+  # pipeline passes (deduped via a hidden marker in the issue body).
+  # Skipped for PRs opened from forks — their GITHUB_TOKEN is read-only and
+  # cannot write issues.
+  open-issue:
+    name: "CI Issue · File / Resolve"
+    needs: gate
+    if: >
+      always() &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: File or resolve the CI-failure issue
+        uses: actions/github-script@v7
+        env:
+          BLOCKED:     ${{ needs.gate.outputs.blocked }}
+          REASONS:     ${{ needs.gate.outputs.reasons }}
+          GATE_RESULT: ${{ needs.gate.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr       = context.payload.pull_request;
+            const prNumber = pr.number;
+            const headRef  = pr.head.ref;
+            const sha7     = pr.head.sha.substring(0, 7);
+            const runUrl   = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const marker   = `<!-- ci-gate:pr-${prNumber} -->`;
+            const label    = 'ci-failure';
+
+            const blocked    = process.env.BLOCKED === 'true';
+            const gateFailed = process.env.GATE_RESULT === 'failure';
+            const reasons    = (process.env.REASONS || '').trim();
+            const failing    = blocked || gateFailed;
+
+            // Find an existing OPEN ci-failure issue for this PR (matched by the
+            // hidden marker so we keep exactly one issue per PR).
+            const items = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            });
+            const existing = items.find(i => !i.pull_request && (i.body || '').includes(marker));
+
+            if (failing) {
+              // Ensure the label exists before we try to apply it.
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+              } catch (e) {
+                if (e.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner, repo, name: label, color: 'd73a49',
+                    description: 'Auto-filed by the CI gate when a PR to main fails',
+                  });
+                } else { throw e; }
+              }
+
+              const title    = `🚨 CI failed on PR #${prNumber}: ${headRef} → main`;
+              const findings = (blocked && reasons)
+                ? reasons
+                : '- ⚙️ A pipeline stage failed to complete (infrastructure/setup error). Open the run log.';
+              const body = [
+                `**Pipeline:** PR to main`,
+                `**Branch:** \`${headRef}\` → \`main\``,
+                `**Commit:** \`${sha7}\``,
+                `**Run:** ${runUrl}`,
+                `**Pull request:** #${prNumber}`,
+                ``,
+                `The CI gate **blocked** PR #${prNumber}. Fix the items below and re-push to the branch.`,
+                ``,
+                `### Blocking findings`,
+                findings,
+                ``,
+                `---`,
+                `<sub>Auto-filed by the CI gate. This issue updates on each failing push and closes automatically once the pipeline passes.</sub>`,
+                ``,
+                marker,
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `🔁 Still failing on \`${sha7}\` — [run #${context.runId}](${runUrl}).`,
+                });
+                core.notice(`Updated CI-failure issue #${existing.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, body,
+                  labels: [label],
+                  assignees: pr.user ? [pr.user.login] : [],
+                });
+                core.notice(`Opened CI-failure issue #${created.data.number}`);
+              }
+            } else {
+              // Pipeline passed — auto-close any open CI-failure issue for this PR.
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `✅ CI now passing on \`${sha7}\` — [run #${context.runId}](${runUrl}). Auto-closing.`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number,
+                  state: 'closed', state_reason: 'completed',
+                });
+                core.notice(`Closed CI-failure issue #${existing.number}`);
+              } else {
+                core.info('No blocking findings and no open CI-failure issue — nothing to do.');
+              }
+            }
