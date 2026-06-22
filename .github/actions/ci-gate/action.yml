@@ -1,12 +1,13 @@
-name: "CI Gate — Report & Decision"
+name: "CI Gate — Decision"
 description: >
-  Consumes all PR stage outputs, writes a colour-coded job summary (badge
-  table + verdict + blocking reasons), and exits non-zero if any blocking
-  finding exists. Used by the gate job in pr-to-main so the evaluation
-  logic lives in exactly one place.
+  Consumes all PR stage outputs and decides whether the merge is blocked.
+  Emits `blocked` / `reasons` / `categories` for the auto-file-issue job and
+  exits non-zero if any blocking finding exists (this is the single required
+  status check). It does NOT write a job summary — each stage already publishes
+  its own report in the UI, so the gate never duplicates it.
 
 inputs:
-  # ── stage run flags (drives SKIP badges) ───────────────────────────────────
+  # ── stage run flags (kept for compatibility; no longer drive a summary) ─────
   stage2_ran:
     description: "Whether Stage 2 ran ('true'/'false')."
     required: false
@@ -102,200 +103,11 @@ outputs:
 runs:
   using: composite
   steps:
-    # ─── Build job summary ───────────────────────────────────────────────────
-    - name: Build summary
-      shell: bash
-      run: |
-        set -uo pipefail
-
-        # ── normalise inputs (empty string → 0 / false) ──────────────────────
-        SECRETS="${{ inputs.secrets }}";           SECRETS="${SECRETS:-0}"
-        DEP_CRITICAL="${{ inputs.dep_critical }}"; DEP_CRITICAL="${DEP_CRITICAL:-0}"
-        DEP_WARN="${{ inputs.dep_warnings }}";     DEP_WARN="${DEP_WARN:-0}"
-        TRIVY_CRIT="${{ inputs.trivy_critical }}"; TRIVY_CRIT="${TRIVY_CRIT:-0}"
-        TRIVY_WARN="${{ inputs.trivy_warnings }}"; TRIVY_WARN="${TRIVY_WARN:-0}"
-        S_CRIT="${{ inputs.static_critical }}";    S_CRIT="${S_CRIT:-0}"
-        S_WARN="${{ inputs.static_warnings }}";    S_WARN="${S_WARN:-0}"
-        ESL="${{ inputs.eslint_errors }}";         ESL="${ESL:-0}"
-        TSE="${{ inputs.ts_errors }}";             TSE="${TSE:-0}"
-        T_PASS="${{ inputs.tests_passed }}";       T_PASS="${T_PASS:-true}"
-        T_FAIL="${{ inputs.test_failures }}";      T_FAIL="${T_FAIL:-0}"
-        SKIP_T="${{ inputs.skip_tests }}";         SKIP_T="${SKIP_T:-false}"
-        B_OK="${{ inputs.build_ok }}";             B_OK="${B_OK:-true}"
-
-        S2="${{ inputs.stage2_ran }}"; S3="${{ inputs.stage3_ran }}"
-        S4="${{ inputs.stage4_ran }}"; S5="${{ inputs.stage5_ran }}"
-
-        # ── aggregates ───────────────────────────────────────────────────────
-        S2_CRIT=$((DEP_CRITICAL + TRIVY_CRIT))
-        S2_WARN=$((DEP_WARN + TRIVY_WARN))
-        TOTAL_CRIT=$((SECRETS + DEP_CRITICAL + TRIVY_CRIT + S_CRIT))
-        TEST_BLOCKED=0;  [ "$T_PASS" != "true" ] && TEST_BLOCKED=1
-        BUILD_BLOCKED=0; [ "$B_OK" != "true" ]   && BUILD_BLOCKED=1
-        ANY_BLOCKED=$(( TOTAL_CRIT + TEST_BLOCKED + BUILD_BLOCKED ))
-
-        # ── badge helpers ────────────────────────────────────────────────────
-        BASE="https://img.shields.io/badge"
-        FAIL_C="d73a49"; PASS_C="2ea44f"; WARN_C="dbab09"; SKIP_C="8b949e"
-
-        # cell <count> <ran>  — red FAIL(n) / green PASS / grey SKIP
-        cell() {
-          local n="${1:-0}" ran="${2:-true}"
-          if [ "$ran" != "true" ]; then
-            echo "![SKIP](${BASE}/SKIP-${SKIP_C}?style=flat)"
-          elif [ "$n" -gt 0 ]; then
-            echo "![FAIL](${BASE}/FAIL%20${n}-${FAIL_C}?style=flat)"
-          else
-            echo "![PASS](${BASE}/PASS-${PASS_C}?style=flat)"
-          fi
-        }
-
-        # tests_cell <passed> <ran> — green PASS / red FAIL / grey SKIP
-        tests_cell() {
-          local p="${1:-true}" ran="${2:-true}"
-          if [ "$ran" != "true" ]; then
-            if [ "$SKIP_T" = "true" ]; then
-              echo "![SKIP](${BASE}/SKIP%20intentional-${SKIP_C}?style=flat)"
-            else
-              echo "![SKIP](${BASE}/SKIP-${SKIP_C}?style=flat)"
-            fi
-          elif [ "$p" = "true" ]; then
-            echo "![PASS](${BASE}/PASS-${PASS_C}?style=flat)"
-          else
-            echo "![FAIL](${BASE}/FAIL-${FAIL_C}?style=flat)"
-          fi
-        }
-
-        # warn_cell <count> — yellow WARN(n) / em dash when clean
-        warn_cell() {
-          local n="${1:-0}"
-          [ "$n" -gt 0 ] \
-            && echo "![WARN](${BASE}/WARN%20${n}-${WARN_C}?style=flat)" \
-            || echo "—"
-        }
-
-        SHORT_SHA="${GITHUB_SHA:0:7}"
-        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-        {
-          echo "# Feature CI · PR #${{ inputs.pr_number }}"
-          echo ""
-          echo "| | |"
-          echo "|---|---|"
-          echo "| **Commit** | \`${SHORT_SHA}\` |"
-          echo "| **Branch** | \`${{ inputs.head_ref }}\` → \`main\` |"
-          echo "| **Run** | [#${GITHUB_RUN_ID}](${RUN_URL}) |"
-          echo ""
-
-          # ── verdict ────────────────────────────────────────────────────────
-          if [ "$ANY_BLOCKED" -gt 0 ]; then
-            echo "## ❌ Result: BLOCKED — merge NOT allowed"
-            echo ""
-            echo "Fix the blocking items below, then re-push to the feature branch."
-            echo ""
-            echo "**Blocking issues:**"
-            [ "$SECRETS" -gt 0 ]      && echo "- 🔑 Secrets — ${SECRETS} finding(s) _(Stage 1)_"
-            [ "$DEP_CRITICAL" -gt 0 ] && echo "- 📦 npm critical/high vulns — ${DEP_CRITICAL} _(Stage 2)_"
-            [ "$TRIVY_CRIT" -gt 0 ]   && echo "- 🛡 Trivy critical — ${TRIVY_CRIT} _(Stage 2)_"
-            [ "$ESL" -gt 0 ]          && echo "- 🔍 ESLint errors — ${ESL} _(Stage 3)_"
-            [ "$TSE" -gt 0 ]          && echo "- 📘 TypeScript errors — ${TSE} _(Stage 3)_"
-            if [ "$TEST_BLOCKED" -gt 0 ]; then
-              if [ "$T_FAIL" -gt 0 ]; then
-                echo "- 🧪 Vitest — ${T_FAIL} test failure(s) _(Stage 4)_"
-              else
-                echo "- 🧪 Vitest — suite/import error (0 tests ran — check Stage 4 job log) _(Stage 4)_"
-              fi
-            fi
-            [ "$BUILD_BLOCKED" -gt 0 ] && echo "- 🏗 Production build FAILED _(Stage 5)_"
-          else
-            echo "## ✅ Result: PASSED — owner can merge"
-            echo ""
-            echo "All checks passed. A repository owner may now merge this PR."
-          fi
-
-          echo ""
-          echo "## Summary"
-          echo ""
-          echo "| Stage | Check | Status | Warnings |"
-          echo "|:-----:|:------|:------:|:--------:|"
-          echo "| 1 | Secrets &amp; credentials | $(cell "$SECRETS" true) | — |"
-          echo "| 2 | Dependencies &amp; Trivy | $(cell "$S2_CRIT" "$S2") | $(warn_cell "$S2_WARN") |"
-          echo "| 3 | Static analysis (ESLint / TS / Prettier) | $(cell "$S_CRIT" "$S3") | $(warn_cell "$S_WARN") |"
-          echo "| 4 | Unit tests (Vitest) | $(tests_cell "$T_PASS" "$S4") | — |"
-          echo "| 5 | Production build | $(cell "$([ "$B_OK" = "true" ] && echo 0 || echo 1)" "$S5") | — |"
-          echo ""
-          echo "<sub>![FAIL](${BASE}/FAIL-${FAIL_C}?style=flat) blocks &nbsp;·&nbsp; ![PASS](${BASE}/PASS-${PASS_C}?style=flat) clean &nbsp;·&nbsp; ![WARN](${BASE}/WARN-${WARN_C}?style=flat) non-blocking &nbsp;·&nbsp; ![SKIP](${BASE}/SKIP-${SKIP_C}?style=flat) not run</sub>"
-
-          # ── Debug guide (only on failure) ─────────────────────────────────
-          if [ "$ANY_BLOCKED" -gt 0 ]; then
-            echo ""
-            echo "---"
-            echo "## 🔍 Where to Find Errors"
-            echo ""
-            echo "| Stage | What failed | Where to look |"
-            echo "|:-----:|:------------|:--------------|"
-
-            if [ "$SECRETS" -gt 0 ]; then
-              echo "| 1 | **${SECRETS} secret(s)** detected | **Annotations tab** → Secret \\[rule\\] in commit · Stage 1 job summary (file + line + commit SHA) |"
-            fi
-            if [ "$DEP_CRITICAL" -gt 0 ]; then
-              echo "| 2 | **${DEP_CRITICAL} npm vuln(s)** critical/high | **Annotations tab** → npm audit \\[critical\\] · Stage 2 job summary (package + CVE + fix version) |"
-            fi
-            if [ "$TRIVY_CRIT" -gt 0 ]; then
-              echo "| 2 | **${TRIVY_CRIT} Trivy finding(s)** | **Annotations tab** → Trivy \\[CRITICAL\\] · Stage 2 job summary (file + CVE + fix) |"
-            fi
-            if [ "$ESL" -gt 0 ]; then
-              echo "| 3 | **${ESL} ESLint error(s)** | **Annotations tab** → ESLint\\[rule\\] inline on PR diff · Stage 3 job summary table (file:line:col) |"
-            fi
-            if [ "$TSE" -gt 0 ]; then
-              echo "| 3 | **${TSE} TypeScript error(s)** | **Annotations tab** → TypeScript TSxxxx inline on PR diff · Stage 3 job summary \`\`\`block |"
-            fi
-            if [ "$TEST_BLOCKED" -gt 0 ]; then
-              if [ "$T_FAIL" -gt 0 ]; then
-                echo "| 4 | **${T_FAIL} test failure(s)** | **Annotations tab** → Test Failed: <name> (file:line) · Stage 4 job summary (suite → test → assertion message) |"
-              else
-                echo "| 4 | **Test suite errored** (0 tests ran) | Stage 4 **job log** → look for import/module errors before any test output |"
-              fi
-            fi
-            if [ "$BUILD_BLOCKED" -gt 0 ]; then
-              echo "| 5 | **Production build failed** | **Annotations tab** → Build Error · Stage 5 job summary error log |"
-            fi
-
-            echo ""
-            echo "> 📌 **Pro tip:** On the workflow run page, click the **Annotations** tab (below the job list)"
-            echo "> to see every error pinned to the exact **file → line → column** that caused it."
-            echo "> On a Pull Request, annotations appear **inline on the diff** next to the offending code."
-            echo ""
-            echo "#### Artifact reports (download from this run's Summary page)"
-            echo ""
-            echo "| Artifact | Contents |"
-            echo "|:---------|:---------|"
-            if [ "$SECRETS" -gt 0 ]; then
-              echo "| \`pr-secrets-*\` | \`gitleaks-report.json\`, \`env-committed.txt\`, \`private-keys-detail.tsv\` |"
-            fi
-            if [ "$DEP_CRITICAL" -gt 0 ] || [ "$TRIVY_CRIT" -gt 0 ]; then
-              echo "| \`pr-deps-*\` | \`npm-audit.json\`, \`trivy-report.json\`, \`trivy-report.sarif\` |"
-            fi
-            if [ "$ESL" -gt 0 ] || [ "$TSE" -gt 0 ]; then
-              echo "| \`pr-static-*\` | \`eslint-report.json\`, \`tsc.log\`, \`prettier.log\` |"
-            fi
-            if [ "$TEST_BLOCKED" -gt 0 ]; then
-              echo "| \`pr-tests-*\` | \`vitest-results.json\`, \`vitest.log\` |"
-            fi
-            if [ "$BUILD_BLOCKED" -gt 0 ]; then
-              echo "| \`pr-build-*\` | \`build.log\` (full build output) |"
-            fi
-          fi
-
-          echo ""
-          echo "---"
-          echo "<sub>Commit \`${SHORT_SHA}\` · Run [#${GITHUB_RUN_ID}](${RUN_URL}) · All artifact reports retained for 7 days.</sub>"
-        } >> "$GITHUB_STEP_SUMMARY"
-
     # ─── Gate decision (computes verdict + emits outputs; never fails here) ──
     # The actual merge-blocking exit lives in the next step, so that the
     # `blocked`/`reasons` outputs are written by a step that always succeeds
     # and therefore reliably propagate to the auto-file-issue job downstream.
+    # No job summary is written here — the gate only decides and reports status.
     - name: Gate decision
       id: decision
       shell: bash

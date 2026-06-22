@@ -1,7 +1,10 @@
 # CI gate for pull requests into main.
-# Four stages run in order (secrets → deps → static → tests); a critical
-# finding stops the chain. The final "gate" job publishes one required status
-# check — "CI Gate · Feature → Main" — that protect-main.json requires to merge.
+# Five stages run in order (secrets → deps → static → tests → build); the first
+# blocking finding stops the chain and every later stage is skipped. Each stage
+# publishes its OWN report (job summary + inline annotations) in the UI. The
+# final "gate" job does NOT re-report — it only publishes the single required
+# status check ("CI Gate · Feature → Main", required by protect-main.json) and,
+# on failure, files a GitHub issue with the detailed findings.
 # Edit only the env block below.
 
 name: "PR to main"
@@ -170,15 +173,20 @@ jobs:
             vitest-results.json
             vitest.log
 
-  # Stage 5 — production build. Runs only when static is clean and tests aren't
-  # failing (a skipped test stage is fine). Catches build-time breakage that
-  # tsc --noEmit can't (bundler config, build-only imports, etc.).
+  # Stage 5 — production build. Runs only when every earlier stage actually
+  # succeeded: static analysis clean (no critical findings) and the test stage
+  # either passed or was intentionally skipped (SKIP_TESTS). If any earlier
+  # stage failed, crashed, or found a blocking issue, the build is SKIPPED —
+  # the pipeline stops and goes straight to the gate (which files the issue).
+  # Catches build-time breakage tsc --noEmit can't (bundler config, etc.).
   stage-5-build:
     name: "Stage 5 · Production Build"
     needs: [stage-3-static, stage-4-tests]
     if: >
-      always() &&
+      !cancelled() &&
+      needs.stage-3-static.result == 'success' &&
       needs.stage-3-static.outputs.critical == '0' &&
+      (needs.stage-4-tests.result == 'success' || needs.stage-4-tests.result == 'skipped') &&
       needs.stage-4-tests.outputs.tests_passed != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -268,11 +276,11 @@ jobs:
           build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
 
       # Parse the downloaded stage reports into a detailed findings document
-      # (file / line / column / commit / message per finding). This feeds both
-      # the final job summary and the auto-filed GitHub issue. Always runs so the
-      # report is available even when the gate decision step fails the job.
-      # (This only assembles a report — it does NOT run the production build.)
-      - name: Collect detailed findings (final summary + issue)
+      # (file / line / column / commit / message per finding) for the auto-filed
+      # GitHub issue ONLY. Always runs so the issue body is available even when
+      # the gate decision step fails the job. This does NOT write a job summary
+      # (each stage already published its own report) and does NOT run the build.
+      - name: Collect detailed findings (issue body)
         if: always()
         shell: bash
         env:
@@ -380,11 +388,9 @@ jobs:
             { echo '```'; echo ""; } >> "$OUT"
           fi
 
-          # Mirror the detailed findings into the final job summary (the "last
-          # summary"), so the problem type, commit and line are all visible there.
-          if grep -q '^### Stage' "$OUT" 2>/dev/null; then
-            { echo ""; echo "## Detailed findings (problem · commit · line)"; echo ""; cat "$OUT"; } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # NOTE: the detailed findings are intentionally NOT mirrored into the
+          # job summary — each stage already published its own report in the UI,
+          # and the gate must not duplicate it. This document feeds the issue only.
 
           if [ ! -s "$OUT" ]; then
             echo "No detailed findings were captured. See the workflow run logs and the Annotations tab on the pull request." > "$OUT"
