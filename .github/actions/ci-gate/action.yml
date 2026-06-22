@@ -95,6 +95,9 @@ outputs:
   reasons:
     description: "Markdown bullet list of blocking findings (used by the auto-filed issue)."
     value: ${{ steps.decision.outputs.reasons }}
+  categories:
+    description: "Space-separated failing categories (e.g. 'secrets dependencies tests'), used as issue labels."
+    value: ${{ steps.decision.outputs.categories }}
 
 runs:
   using: composite
@@ -311,41 +314,43 @@ runs:
 
         BLOCK=0; REASONS=""
         LINES=""
+        CATEGORIES=""
         add_line() { LINES="${LINES}- $1"$'\n'; }
+        add_cat()  { case " $CATEGORIES " in *" $1 "*) ;; *) CATEGORIES="${CATEGORIES}${CATEGORIES:+ }$1";; esac; }
 
         if [ "$SECRETS" -gt 0 ]; then
-          BLOCK=1; REASONS="${REASONS} secrets(${SECRETS});"
-          add_line "🔑 **Secrets** — ${SECRETS} finding(s) _(Stage 1)_"
+          BLOCK=1; REASONS="${REASONS} secrets(${SECRETS});"; add_cat "secrets"
+          add_line "Stage 1 — Secrets and credentials: ${SECRETS} finding(s)."
           echo "::error title=Stage 1 — Secrets::${SECRETS} secret(s) found in git history. See the Annotations tab for file + line + commit details."
         fi
         if [ "$DEP_CRITICAL" -gt 0 ]; then
-          BLOCK=1; REASONS="${REASONS} npm-vulns(${DEP_CRITICAL});"
-          add_line "📦 **npm critical/high vulns** — ${DEP_CRITICAL} _(Stage 2)_"
+          BLOCK=1; REASONS="${REASONS} npm-vulns(${DEP_CRITICAL});"; add_cat "dependencies"
+          add_line "Stage 2 — Dependency vulnerabilities (npm audit): ${DEP_CRITICAL} critical/high."
           echo "::error title=Stage 2 — npm audit::${DEP_CRITICAL} critical/high npm vulnerability(s). See the Annotations tab for package + fix version details."
         fi
         if [ "$TRIVY_CRIT" -gt 0 ]; then
-          BLOCK=1; REASONS="${REASONS} trivy(${TRIVY_CRIT});"
-          add_line "🛡 **Trivy critical/high** — ${TRIVY_CRIT} _(Stage 2)_"
+          BLOCK=1; REASONS="${REASONS} trivy(${TRIVY_CRIT});"; add_cat "dependencies"
+          add_line "Stage 2 — Trivy critical/high findings: ${TRIVY_CRIT}."
           echo "::error title=Stage 2 — Trivy::${TRIVY_CRIT} critical/high Trivy finding(s). See the Annotations tab for file + CVE details."
         fi
         if [ "$ESL" -gt 0 ]; then
-          BLOCK=1; REASONS="${REASONS} eslint-errors(${ESL});"
-          add_line "🔍 **ESLint errors** — ${ESL} _(Stage 3)_"
+          BLOCK=1; REASONS="${REASONS} eslint-errors(${ESL});"; add_cat "static-analysis"
+          add_line "Stage 3 — ESLint errors: ${ESL}."
           echo "::error title=Stage 3 — ESLint::${ESL} ESLint error(s). See the Annotations tab for inline file:line:col locations on the PR diff."
         fi
         if [ "$TSE" -gt 0 ]; then
-          BLOCK=1; REASONS="${REASONS} ts-errors(${TSE});"
-          add_line "📘 **TypeScript errors** — ${TSE} _(Stage 3)_"
+          BLOCK=1; REASONS="${REASONS} ts-errors(${TSE});"; add_cat "static-analysis"
+          add_line "Stage 3 — TypeScript errors: ${TSE}."
           echo "::error title=Stage 3 — TypeScript::${TSE} TypeScript type error(s). See the Annotations tab for inline file:line:col locations."
         fi
         if [ "$T_PASS" != "true" ]; then
-          BLOCK=1; REASONS="${REASONS} test-failures(${T_FAIL});"
-          add_line "🧪 **Vitest** — ${T_FAIL} test failure(s) _(Stage 4)_"
+          BLOCK=1; REASONS="${REASONS} test-failures(${T_FAIL});"; add_cat "tests"
+          add_line "Stage 4 — Failing unit tests (Vitest): ${T_FAIL}."
           echo "::error title=Stage 4 — Vitest::${T_FAIL} test(s) failed. See the Annotations tab for test name + file:line + assertion message."
         fi
         if [ "$B_OK" != "true" ]; then
-          BLOCK=1; REASONS="${REASONS} build-failed;"
-          add_line "🏗 **Production build FAILED** _(Stage 5)_"
+          BLOCK=1; REASONS="${REASONS} build-failed;"; add_cat "build"
+          add_line "Stage 5 — Production build failed."
           echo "::error title=Stage 5 — Production Build::Build failed. See the Annotations tab for file:line error locations; download the pr-build artifact for the full log."
         fi
 
@@ -354,8 +359,9 @@ runs:
           echo "blocked=true" >> "$GITHUB_OUTPUT"
         else
           echo "blocked=false" >> "$GITHUB_OUTPUT"
-          LINES="- _No blocking findings._"$'\n'
+          LINES="- No blocking findings."$'\n'
         fi
+        echo "categories=${CATEGORIES}" >> "$GITHUB_OUTPUT"
         {
           echo "reasons<<__REASONS_EOF__"
           printf '%s' "$LINES"
