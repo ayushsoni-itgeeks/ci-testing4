@@ -88,6 +88,14 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  blocked:
+    description: "'true' if the gate blocked the merge, else 'false'."
+    value: ${{ steps.decision.outputs.blocked }}
+  reasons:
+    description: "Markdown bullet list of blocking findings (used by the auto-filed issue)."
+    value: ${{ steps.decision.outputs.reasons }}
+
 runs:
   using: composite
   steps:
@@ -281,8 +289,12 @@ runs:
           echo "<sub>Commit \`${SHORT_SHA}\` · Run [#${GITHUB_RUN_ID}](${RUN_URL}) · All artifact reports retained for 7 days.</sub>"
         } >> "$GITHUB_STEP_SUMMARY"
 
-    # ─── Gate decision (exit 1 = required status check fails) ────────────────
+    # ─── Gate decision (computes verdict + emits outputs; never fails here) ──
+    # The actual merge-blocking exit lives in the next step, so that the
+    # `blocked`/`reasons` outputs are written by a step that always succeeds
+    # and therefore reliably propagate to the auto-file-issue job downstream.
     - name: Gate decision
+      id: decision
       shell: bash
       run: |
         set -uo pipefail
@@ -298,40 +310,72 @@ runs:
         B_OK="${{ inputs.build_ok }}";             B_OK="${B_OK:-true}"
 
         BLOCK=0; REASONS=""
+        LINES=""
+        add_line() { LINES="${LINES}- $1"$'\n'; }
+
         if [ "$SECRETS" -gt 0 ]; then
           BLOCK=1; REASONS="${REASONS} secrets(${SECRETS});"
+          add_line "🔑 **Secrets** — ${SECRETS} finding(s) _(Stage 1)_"
           echo "::error title=Stage 1 — Secrets::${SECRETS} secret(s) found in git history. See the Annotations tab for file + line + commit details."
         fi
         if [ "$DEP_CRITICAL" -gt 0 ]; then
           BLOCK=1; REASONS="${REASONS} npm-vulns(${DEP_CRITICAL});"
+          add_line "📦 **npm critical/high vulns** — ${DEP_CRITICAL} _(Stage 2)_"
           echo "::error title=Stage 2 — npm audit::${DEP_CRITICAL} critical/high npm vulnerability(s). See the Annotations tab for package + fix version details."
         fi
         if [ "$TRIVY_CRIT" -gt 0 ]; then
           BLOCK=1; REASONS="${REASONS} trivy(${TRIVY_CRIT});"
+          add_line "🛡 **Trivy critical/high** — ${TRIVY_CRIT} _(Stage 2)_"
           echo "::error title=Stage 2 — Trivy::${TRIVY_CRIT} critical/high Trivy finding(s). See the Annotations tab for file + CVE details."
         fi
         if [ "$ESL" -gt 0 ]; then
           BLOCK=1; REASONS="${REASONS} eslint-errors(${ESL});"
+          add_line "🔍 **ESLint errors** — ${ESL} _(Stage 3)_"
           echo "::error title=Stage 3 — ESLint::${ESL} ESLint error(s). See the Annotations tab for inline file:line:col locations on the PR diff."
         fi
         if [ "$TSE" -gt 0 ]; then
           BLOCK=1; REASONS="${REASONS} ts-errors(${TSE});"
+          add_line "📘 **TypeScript errors** — ${TSE} _(Stage 3)_"
           echo "::error title=Stage 3 — TypeScript::${TSE} TypeScript type error(s). See the Annotations tab for inline file:line:col locations."
         fi
         if [ "$T_PASS" != "true" ]; then
           BLOCK=1; REASONS="${REASONS} test-failures(${T_FAIL});"
+          add_line "🧪 **Vitest** — ${T_FAIL} test failure(s) _(Stage 4)_"
           echo "::error title=Stage 4 — Vitest::${T_FAIL} test(s) failed. See the Annotations tab for test name + file:line + assertion message."
         fi
         if [ "$B_OK" != "true" ]; then
           BLOCK=1; REASONS="${REASONS} build-failed;"
+          add_line "🏗 **Production build FAILED** _(Stage 5)_"
           echo "::error title=Stage 5 — Production Build::Build failed. See the Annotations tab for file:line error locations; download the pr-build artifact for the full log."
         fi
+
+        # ── emit outputs for the auto-file-issue job ─────────────────────────
+        if [ "$BLOCK" -gt 0 ]; then
+          echo "blocked=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "blocked=false" >> "$GITHUB_OUTPUT"
+          LINES="- _No blocking findings._"$'\n'
+        fi
+        {
+          echo "reasons<<__REASONS_EOF__"
+          printf '%s' "$LINES"
+          echo "__REASONS_EOF__"
+        } >> "$GITHUB_OUTPUT"
 
         if [ "$BLOCK" -gt 0 ]; then
           echo ""
           echo "::error::CI Gate FAILED ▸ ${REASONS% }"
           echo "         → Open the Annotations tab on this run for exact file:line:col error locations."
-          exit 1
+        else
+          echo "✅ CI Gate PASSED — no blocking findings."
         fi
 
+    # ─── Enforce gate (exit 1 = required status check fails) ─────────────────
+    - name: Enforce gate decision
+      shell: bash
+      run: |
+        if [ "${{ steps.decision.outputs.blocked }}" = "true" ]; then
+          echo "::error::CI Gate FAILED — merge blocked. See blocking findings above and the Annotations tab."
+          exit 1
+        fi
         echo "✅ CI Gate PASSED — no blocking findings."
