@@ -1,0 +1,45 @@
+name: "Stage Failure Report"
+description: >
+  Writes a job-summary report and an error annotation when a stage job fails
+  to COMPLETE — an infrastructure / setup error (npm ci, Node setup, checkout,
+  scanner install, …) rather than a scan finding. Guarantees a failing stage is
+  never silent: even when the stage's normal findings report never ran, the
+  reason the job went red is surfaced in the job summary. Call it as the last
+  step of a stage job with `if: failure()`.
+
+inputs:
+  stage:
+    description: "Human-readable stage label, e.g. 'Stage 3 · Static Code Analysis'."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Report stage failure
+      shell: bash
+      run: |
+        set -uo pipefail
+        SHORT_SHA="${GITHUB_SHA:0:7}"
+        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        {
+          echo "### ❌ ${{ inputs.stage }} — FAILED to complete — commit \`${SHORT_SHA}\`"
+          echo ""
+          echo "This stage did not finish, so its normal findings report was not produced."
+          echo "This is an infrastructure / setup error (e.g. \`npm ci\`, Node setup, checkout,"
+          echo "or a scanner install) — **not** a scan finding."
+          echo ""
+
+          # Most common cause: dependency install. setup-node tees its output here.
+          if [ -s npm-ci.log ]; then
+            echo "#### \`npm ci\` output (last 60 lines)"
+            echo '```'
+            tail -60 npm-ci.log | sed 's/\r//'
+            echo '```'
+            echo ""
+          fi
+
+          echo "**Where to look:** the failed step is marked red in this job's log · [workflow run #${GITHUB_RUN_ID}](${RUN_URL})."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "::error title=${{ inputs.stage }} failed to complete::Setup/infrastructure error (e.g. npm ci). Open this job's summary and the red step in its log."

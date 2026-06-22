@@ -57,6 +57,12 @@ jobs:
             private-keys-detail.tsv
             private-key-content.txt
 
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 1 · Secrets & Credentials"
+
   # Stage 2 — dependency vulns (npm audit + Trivy). Runs only if stage 1 is clean.
   stage-2-deps:
     name: "Stage 2 · Dependencies & Vulnerabilities"
@@ -98,6 +104,12 @@ jobs:
             deprecated.txt
             trivy-report.json
             trivy-report.sarif
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 2 · Dependencies & Vulnerabilities"
 
   # Stage 3 — static analysis (ESLint + tsc + Prettier). Runs only if deps are clean.
   stage-3-static:
@@ -154,6 +166,12 @@ jobs:
             tsc.log
             prettier.log
 
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 3 · Static Code Analysis"
+
   # Stage 4 — Vitest. Runs only if static is clean, SKIP_TESTS isn't set, AND the
   # repo actually contains test files (detected in Stage 3). No tests → skipped.
   stage-4-tests:
@@ -191,6 +209,12 @@ jobs:
           path: |
             vitest-results.json
             vitest.log
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 4 · Unit Tests (Vitest)"
 
   # Stage 5 — production build. Runs only when every earlier stage actually
   # succeeded: static analysis clean (no critical findings) and the test stage
@@ -233,6 +257,12 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
           path: build.log
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 5 · Production Build"
 
   # Gate — the single required status check. Aggregates every stage and decides.
   gate:
