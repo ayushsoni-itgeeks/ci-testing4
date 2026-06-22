@@ -15,4 +15,10 @@ COPY . .
 
 RUN npm run build
 
+# Run as the unprivileged built-in "node" user instead of root.
+# The app writes the SQLite database and runs prisma migrate deploy at
+# startup, so the app directory must be owned by that user.
+RUN chown -R node:node /app
+USER node
+
 CMD ["npm", "run", "docker-start"]
