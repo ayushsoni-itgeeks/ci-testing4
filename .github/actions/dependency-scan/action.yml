@@ -156,10 +156,9 @@ runs:
           if [ "$OUTDATED" -gt 0 ] && [ -s npm-outdated.json ]; then
             echo ""
             echo "#### Outdated Packages"
-            echo "| Package | Current | Latest |"
-            echo "|:--------|:--------|:-------|:-------|"
-            jq -r 'to_entries[] | select(.value.wanted != .value.latest) | "| `" + .key + "` | "  +
-              " | " + (.value.wanted // "?") + " | " + (.value.latest // "?") + " |"' \
+            echo "| Package | Wanted | Latest |"
+            echo "|:--------|:-------|:-------|"
+            jq -r 'to_entries[] | select(.value.wanted != .value.latest) | "| `" + .key + "` | " + (.value.wanted // "?") + " | " + (.value.latest // "?") + " |"' \
               npm-outdated.json 2>/dev/null | head -20 || true
           fi
         } >> "$GITHUB_STEP_SUMMARY"
