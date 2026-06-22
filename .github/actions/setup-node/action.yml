@@ -1,0 +1,26 @@
+name: "Setup Node & Install"
+description: "Install a pinned Node version with npm cache, then optionally run npm ci."
+
+inputs:
+  node-version:
+    description: "Node.js version (match package.json engines)."
+    required: false
+    default: "20"
+  install:
+    description: "Run npm ci after setup. Set 'false' for scan-only jobs."
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: "npm"
+
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      run: npm ci

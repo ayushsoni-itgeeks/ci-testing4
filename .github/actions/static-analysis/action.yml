@@ -1,0 +1,215 @@
+name: "Static Code Analysis"
+description: "ESLint + tsc (--noEmit) + Prettier (--check). Emits `critical` (ESLint + TS errors, blocking) and `warnings` (ESLint warnings + Prettier drift). Never fails the job — the gate decides."
+
+outputs:
+  critical:
+    description: "Blocking: ESLint errors + TypeScript type errors."
+    value: ${{ steps.evaluate.outputs.critical }}
+  warnings:
+    description: "Non-blocking: ESLint warnings + Prettier drift."
+    value: ${{ steps.evaluate.outputs.warnings }}
+  eslint_errors:
+    description: "ESLint error count."
+    value: ${{ steps.evaluate.outputs.eslint_errors }}
+  eslint_warnings:
+    description: "ESLint warning count."
+    value: ${{ steps.evaluate.outputs.eslint_warnings }}
+  ts_errors:
+    description: "TypeScript type error count."
+    value: ${{ steps.evaluate.outputs.ts_errors }}
+  prettier_issues:
+    description: "Files not Prettier-formatted."
+    value: ${{ steps.evaluate.outputs.prettier_issues }}
+
+runs:
+  using: composite
+  steps:
+    # ESLint → JSON report (for the summary) + a human-readable log.
+    - name: ESLint
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx eslint . \
+          --ignore-path .gitignore \
+          --ext .js,.jsx,.ts,.tsx \
+          --format json \
+          --output-file eslint-report.json \
+          || echo "ESLint reported problems (captured)"
+        if [ ! -s eslint-report.json ]; then echo '[]' > eslint-report.json; fi
+
+        npx eslint . \
+          --ignore-path .gitignore \
+          --ext .js,.jsx,.ts,.tsx \
+          > eslint.log 2>&1 || true
+
+    # Generate route types, then type-check. Any "error TS####" is blocking.
+    - name: TypeScript typecheck
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx react-router typegen || echo "typegen exited non-zero (captured)"
+        npx tsc --noEmit --pretty false > tsc.log 2>&1 \
+          || echo "tsc reported type errors (captured)"
+        if [ ! -f tsc.log ]; then : > tsc.log; fi
+
+    # Formatting drift is a warning, never blocking.
+    - name: Prettier check
+      shell: bash
+      run: |
+        set -uo pipefail
+        npx prettier --check . > prettier.log 2>&1 \
+          || echo "Prettier reported unformatted files (captured)"
+        if [ ! -f prettier.log ]; then : > prettier.log; fi
+
+    # critical = eslint errors + ts errors; warnings = eslint warnings + prettier.
+    - name: Evaluate
+      id: evaluate
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        ESLINT_ERRORS=0
+        ESLINT_WARNINGS=0
+        if [ -s eslint-report.json ]; then
+          ESLINT_ERRORS=$(jq   '[.[].errorCount]   | add // 0' eslint-report.json 2>/dev/null || echo 0)
+          ESLINT_WARNINGS=$(jq '[.[].warningCount] | add // 0' eslint-report.json 2>/dev/null || echo 0)
+        fi
+
+        # grep -c prints 0 on no match; || true swallows its exit (|| echo 0 would
+        # add a second line and break the arithmetic below).
+        TS_ERRORS=0
+        if [ -s tsc.log ]; then
+          TS_ERRORS=$(grep -cE 'error TS[0-9]+' tsc.log 2>/dev/null || true)
+        fi
+
+        # One "[warn] <file>" per file; drop the trailing "[warn] Code style…" summary.
+        PRETTIER_ISSUES=0
+        if [ -s prettier.log ]; then
+          PRETTIER_ISSUES=$(grep -E '^\[warn\] ' prettier.log 2>/dev/null | grep -cvE 'Code style|--write' || true)
+        fi
+
+        # Normalise to clean integers.
+        ESLINT_ERRORS=$(printf '%s' "${ESLINT_ERRORS:-0}" | tr -cd '0-9'); ESLINT_ERRORS=${ESLINT_ERRORS:-0}
+        ESLINT_WARNINGS=$(printf '%s' "${ESLINT_WARNINGS:-0}" | tr -cd '0-9'); ESLINT_WARNINGS=${ESLINT_WARNINGS:-0}
+        TS_ERRORS=$(printf '%s' "${TS_ERRORS:-0}" | tr -cd '0-9'); TS_ERRORS=${TS_ERRORS:-0}
+        PRETTIER_ISSUES=$(printf '%s' "${PRETTIER_ISSUES:-0}" | tr -cd '0-9'); PRETTIER_ISSUES=${PRETTIER_ISSUES:-0}
+
+        CRITICAL=$((ESLINT_ERRORS + TS_ERRORS))
+        WARNINGS=$((ESLINT_WARNINGS + PRETTIER_ISSUES))
+
+        echo "Static analysis blocking: eslint_errors=$ESLINT_ERRORS ts_errors=$TS_ERRORS -> $CRITICAL"
+        echo "Static analysis warnings: eslint_warnings=$ESLINT_WARNINGS prettier=$PRETTIER_ISSUES -> $WARNINGS"
+
+        {
+          echo "critical=$CRITICAL"
+          echo "warnings=$WARNINGS"
+          echo "eslint_errors=$ESLINT_ERRORS"
+          echo "eslint_warnings=$ESLINT_WARNINGS"
+          echo "ts_errors=$TS_ERRORS"
+          echo "prettier_issues=$PRETTIER_ISSUES"
+        } >> "$GITHUB_OUTPUT"
+
+    # Inline ::error/::warning annotations (file:line:col) + a summary table.
+    - name: Report findings (annotations + summary)
+      if: always()
+      shell: bash
+      run: |
+        set -uo pipefail
+        SHORT_SHA="${GITHUB_SHA:0:7}"
+
+        if [ -s eslint-report.json ]; then
+          jq -r '
+            .[] |
+            . as $file |
+            .filePath as $path |
+            .messages[] |
+            [
+              (if .severity == 2 then "error" else "warning" end),
+              ($path | ltrimstr(env.GITHUB_WORKSPACE + "/")),
+              (.line   // 1 | tostring),
+              (.column // 1 | tostring),
+              (.ruleId // "eslint"),
+              .message
+            ] | join("\t")
+          ' eslint-report.json 2>/dev/null \
+          | while IFS=$'\t' read -r severity file line col rule msg; do
+              printf '::%s file=%s,line=%s,col=%s,title=ESLint[%s]::%s\n' \
+                "$severity" "$file" "$line" "$col" "$rule" "$msg"
+            done || true
+        fi
+
+        # tsc format: path(line,col): error TSxxxx: message
+        if [ -s tsc.log ]; then
+          grep -E '^.*\([0-9]+,[0-9]+\): error TS' tsc.log 2>/dev/null \
+          | sed 's/\r//' \
+          | while IFS= read -r ln; do
+              file=$(echo "$ln" | sed 's/(\([0-9]*\),\([0-9]*\)).*//')
+              line=$(echo "$ln" | grep -oP '(?<=\()\d+(?=,)')
+              col=$( echo "$ln" | grep -oP '(?<=,)\d+(?=\))')
+              msg=$( echo "$ln" | sed 's/.*): //')
+              code=$(echo "$msg" | grep -oP 'TS\d+')
+              file="${file#./}"
+              printf '::error file=%s,line=%s,col=%s,title=TypeScript %s::%s\n' \
+                "$file" "${line:-1}" "${col:-1}" "${code:-TS}" "$msg"
+            done || true
+        fi
+
+        if [ -s prettier.log ]; then
+          grep -E '^\[warn\] ' prettier.log 2>/dev/null \
+          | grep -vE 'Code style|--write' \
+          | while IFS= read -r ln; do
+              file=$(echo "$ln" | sed 's/\[warn\] //')
+              printf '::warning file=%s,line=1,title=Prettier::File needs formatting\n' "$file"
+            done || true
+        fi
+
+        ESLINT_E=$(jq '[.[].errorCount]   | add // 0' eslint-report.json 2>/dev/null || echo 0)
+        ESLINT_W=$(jq '[.[].warningCount] | add // 0' eslint-report.json 2>/dev/null || echo 0)
+        TS_E=$(grep -cE 'error TS[0-9]+' tsc.log 2>/dev/null || true); TS_E=${TS_E:-0}
+        PRETTIER_W=$(grep -cE '^\[warn\] ' prettier.log 2>/dev/null || true); PRETTIER_W=${PRETTIER_W:-0}
+
+        {
+          echo "### Stage 3 · Static Analysis — commit \`${SHORT_SHA}\`"
+          echo ""
+          echo "| Tool | Errors (blocking) | Warnings |"
+          echo "|:-----|:-----------------:|:--------:|"
+          echo "| ESLint | ${ESLINT_E} | ${ESLINT_W} |"
+          echo "| TypeScript | ${TS_E} | 0 |"
+          echo "| Prettier | 0 | ${PRETTIER_W} |"
+
+          if [ -s eslint-report.json ] && [ "${ESLINT_E}" -gt 0 ]; then
+            echo ""
+            echo "#### ESLint Errors"
+            echo "| File | Line | Col | Rule | Message |"
+            echo "|:-----|-----:|----:|:-----|:--------|"
+            jq -r '
+              .[] | .filePath as $path | .messages[] |
+              select(.severity == 2) |
+              [
+                ($path | ltrimstr(env.GITHUB_WORKSPACE + "/")),
+                (.line   // 1 | tostring),
+                (.column // 1 | tostring),
+                (.ruleId // "-"),
+                .message
+              ] | "| `" + .[0] + "` | " + .[1] + " | " + .[2] + " | `" + .[3] + "` | " + .[4] + " |"
+            ' eslint-report.json 2>/dev/null | head -50 || true
+          fi
+
+          if [ -s tsc.log ] && [ "${TS_E}" -gt 0 ]; then
+            echo ""
+            echo "#### TypeScript Errors"
+            echo '```'
+            grep -E '^.*\([0-9]+,[0-9]+\): error TS' tsc.log 2>/dev/null \
+              | sed 's/\r//' | head -30 || true
+            echo '```'
+          fi
+
+          if [ -s prettier.log ] && [ "${PRETTIER_W}" -gt 0 ]; then
+            echo ""
+            echo "#### Prettier — Files needing format"
+            echo '```'
+            grep -E '^\[warn\] ' prettier.log | grep -vE 'Code style|--write' \
+              | sed 's/\[warn\] //' | head -20 || true
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

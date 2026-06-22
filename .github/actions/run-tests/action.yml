@@ -1,0 +1,106 @@
+name: "Run Vitest"
+description: "Run Vitest with a JSON reporter and expose tests_passed + test_failures. Never fails the job — the gate decides."
+
+inputs:
+  vitest-cmd:
+    description: "Vitest command to run."
+    required: false
+    default: "npx vitest run --reporter=verbose"
+
+outputs:
+  tests_passed:
+    description: "'true' if all tests passed, 'false' otherwise."
+    value: ${{ steps.run.outputs.tests_passed }}
+  test_failures:
+    description: "Number of failed tests (0 when all pass)."
+    value: ${{ steps.run.outputs.test_failures }}
+
+runs:
+  using: composite
+  steps:
+    - name: Run Vitest
+      id: run
+      shell: bash
+      run: |
+        set -uo pipefail
+        EXIT=0
+        ${{ inputs.vitest-cmd }} --reporter=json --outputFile=vitest-results.json \
+          2>&1 | tee vitest.log || EXIT=$?
+
+        if [ "$EXIT" -eq 0 ]; then
+          echo "tests_passed=true" >> "$GITHUB_OUTPUT"
+          echo "test_failures=0"   >> "$GITHUB_OUTPUT"
+        else
+          # Count failures from the JSON; fall back to the raw exit code.
+          FAIL_COUNT=$(jq \
+            '.testResults | map(.assertionResults[] | select(.status=="failed")) | length' \
+            vitest-results.json 2>/dev/null || echo "$EXIT")
+          echo "tests_passed=false"          >> "$GITHUB_OUTPUT"
+          echo "test_failures=${FAIL_COUNT}" >> "$GITHUB_OUTPUT"
+        fi
+
+    # One ::error annotation per failed test (file, line, name, message) plus a
+    # summary table, so failures show inline on the PR diff.
+    - name: Report findings (annotations + summary)
+      if: always()
+      shell: bash
+      run: |
+        set -uo pipefail
+        SHORT_SHA="${GITHUB_SHA:0:7}"
+
+        if [ -s vitest-results.json ]; then
+          jq -r '
+            .testResults[]? |
+            .testFilePath as $file |
+            .assertionResults[]? |
+            select(.status == "failed") |
+            [
+              ($file | ltrimstr(env.GITHUB_WORKSPACE + "/")),
+              ((.location.line // 1) | tostring),
+              .ancestorTitles[-1] // "",
+              .title,
+              ((.failureMessages // []) | join(" | ") | gsub("\n";" ") | .[0:200])
+            ] | join("\t")
+          ' vitest-results.json 2>/dev/null \
+          | while IFS=$'\t' read -r file line suite title msg; do
+              test_name="${suite:+${suite} > }${title}"
+              printf '::error file=%s,line=%s,title=Test Failed: %s::%s\n' \
+                "$file" "$line" "$test_name" "${msg:-Assertion failed}"
+            done || true
+        fi
+
+        TOTAL=0; PASSED=0; FAILED=0; SKIPPED=0
+        if [ -s vitest-results.json ]; then
+          TOTAL=$(  jq '[.testResults[]?.assertionResults[]?] | length'                          vitest-results.json 2>/dev/null || echo 0)
+          PASSED=$( jq '[.testResults[]?.assertionResults[]? | select(.status=="passed")]  | length' vitest-results.json 2>/dev/null || echo 0)
+          FAILED=$( jq '[.testResults[]?.assertionResults[]? | select(.status=="failed")]  | length' vitest-results.json 2>/dev/null || echo 0)
+          SKIPPED=$(jq '[.testResults[]?.assertionResults[]? | select(.status=="pending")] | length' vitest-results.json 2>/dev/null || echo 0)
+        fi
+
+        {
+          echo "### Stage 4 · Unit Tests (Vitest) — commit \`${SHORT_SHA}\`"
+          echo ""
+          echo "| Result | Count |"
+          echo "|:-------|------:|"
+          echo "| ✅ Passed  | ${PASSED} |"
+          echo "| ❌ Failed  | ${FAILED} |"
+          echo "| ⏭ Skipped | ${SKIPPED} |"
+          echo "| **Total**  | **${TOTAL}** |"
+
+          if [ "${FAILED}" -gt 0 ] && [ -s vitest-results.json ]; then
+            echo ""
+            echo "#### Failed Tests"
+            echo "| File | Line | Suite | Test | Error |"
+            echo "|:-----|-----:|:------|:-----|:------|"
+            jq -r '
+              .testResults[]? |
+              .testFilePath as $file |
+              .assertionResults[]? |
+              select(.status == "failed") |
+              "| `" + ($file | ltrimstr(env.GITHUB_WORKSPACE + "/")) + "` | " +
+              ((.location.line // 1) | tostring) + " | " +
+              (.ancestorTitles[-1] // "-") + " | **" + .title + "** | " +
+              ((.failureMessages // []) | .[0] // "-" | gsub("\n"; " ") | .[0:120]) + " |"
+            ' vitest-results.json 2>/dev/null | head -30 || true
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

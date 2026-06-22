@@ -1,0 +1,263 @@
+# CI gate for pull requests into main.
+# Four stages run in order (secrets → deps → static → tests); a critical
+# finding stops the chain. The final "gate" job publishes one required status
+# check — "CI Gate · Feature → Main" — that protect-main.json requires to merge.
+# Edit only the env block below.
+
+name: "PR to main"
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-to-main-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"                                 # match package.json engines.node
+  VITEST_CMD:   "npx vitest run --reporter=verbose"  # your test command
+  BUILD_CMD:    "npm run build"                      # your production build command
+  USE_PRISMA:   "true"                               # run prisma generate before building
+  SKIP_TESTS:   ${{ vars.SKIP_TESTS || 'false' }}    # repo var SKIP_TESTS=true skips stage 4
+
+jobs:
+  # Stage 1 — secret scan (Gitleaks, TruffleHog, .env, private keys).
+  stage-1-secrets:
+    name: "Stage 1 · Secrets & Credentials"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # full history — scanners check every commit
+
+      - name: Secret scan
+        id: scan
+        uses: ./.github/actions/secret-scan
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-secrets-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            gitleaks-report.json
+            trufflehog-history.json
+            env-committed.txt
+            private-keys-detail.tsv
+            private-key-content.txt
+
+  # Stage 2 — dependency vulns (npm audit + Trivy). Runs only if stage 1 is clean.
+  stage-2-deps:
+    name: "Stage 2 · Dependencies & Vulnerabilities"
+    needs: stage-1-secrets
+    if: needs.stage-1-secrets.outputs.findings == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      critical:       ${{ steps.deps.outputs.critical }}
+      warnings:       ${{ steps.deps.outputs.warnings }}
+      trivy_critical: ${{ steps.trivy.outputs.critical }}
+      trivy_warnings: ${{ steps.trivy.outputs.warnings }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          install: "false"   # lockfile-only scan — no install needed
+
+      - name: Dependency scan
+        id: deps
+        uses: ./.github/actions/dependency-scan
+
+      - name: Trivy scan
+        id: trivy
+        uses: ./.github/actions/trivy-scan
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-deps-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            npm-audit.json
+            npm-outdated.json
+            deprecated.txt
+            trivy-report.json
+            trivy-report.sarif
+
+  # Stage 3 — static analysis (ESLint + tsc + Prettier). Runs only if deps are clean.
+  stage-3-static:
+    name: "Stage 3 · Static Code Analysis"
+    needs: stage-2-deps
+    if: >
+      needs.stage-2-deps.outputs.critical == '0' &&
+      needs.stage-2-deps.outputs.trivy_critical == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      critical:        ${{ steps.static.outputs.critical }}
+      warnings:        ${{ steps.static.outputs.warnings }}
+      eslint_errors:   ${{ steps.static.outputs.eslint_errors }}
+      eslint_warnings: ${{ steps.static.outputs.eslint_warnings }}
+      ts_errors:       ${{ steps.static.outputs.ts_errors }}
+      prettier_issues: ${{ steps.static.outputs.prettier_issues }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node & install
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Static analysis
+        id: static
+        uses: ./.github/actions/static-analysis
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-static-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            eslint-report.json
+            eslint.log
+            tsc.log
+            prettier.log
+
+  # Stage 4 — Vitest. Runs only if static is clean and SKIP_TESTS isn't set.
+  stage-4-tests:
+    name: "Stage 4 · Unit Tests (Vitest)"
+    needs: stage-3-static
+    if: needs.stage-3-static.outputs.critical == '0' && vars.SKIP_TESTS != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tests_passed:  ${{ steps.tests.outputs.tests_passed }}
+      test_failures: ${{ steps.tests.outputs.test_failures }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node & install
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run Vitest
+        id: tests
+        uses: ./.github/actions/run-tests
+        with:
+          vitest-cmd: ${{ env.VITEST_CMD }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-tests-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            vitest-results.json
+            vitest.log
+
+  # Stage 5 — production build. Runs only when static is clean and tests aren't
+  # failing (a skipped test stage is fine). Catches build-time breakage that
+  # tsc --noEmit can't (bundler config, build-only imports, etc.).
+  stage-5-build:
+    name: "Stage 5 · Production Build"
+    needs: [stage-3-static, stage-4-tests]
+    if: >
+      always() &&
+      needs.stage-3-static.outputs.critical == '0' &&
+      needs.stage-4-tests.outputs.tests_passed != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      build_ok: ${{ steps.build.outputs.build_ok }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node & install
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build application
+        id: build
+        uses: ./.github/actions/build-app
+        with:
+          build-cmd:  ${{ env.BUILD_CMD }}
+          use-prisma: ${{ env.USE_PRISMA }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-build-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: build.log
+
+  # Gate — the single required status check. Aggregates every stage and decides.
+  gate:
+    name: "CI Gate · Feature → Main"   # must match the check name in protect-main.json
+    needs: [stage-1-secrets, stage-2-deps, stage-3-static, stage-4-tests, stage-5-build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # A crashed stage (e.g. failed npm ci) leaves empty outputs the gate would
+      # read as "0 findings". Fail explicitly so it can't pass as green.
+      # (A deliberately skipped stage has result 'skipped', not 'failure'.)
+      - name: Guard — every stage must have completed
+        if: >
+          needs.stage-1-secrets.result == 'failure' || needs.stage-1-secrets.result == 'cancelled' ||
+          needs.stage-2-deps.result    == 'failure' || needs.stage-2-deps.result    == 'cancelled' ||
+          needs.stage-3-static.result  == 'failure' || needs.stage-3-static.result  == 'cancelled' ||
+          needs.stage-4-tests.result   == 'failure' || needs.stage-4-tests.result   == 'cancelled' ||
+          needs.stage-5-build.result   == 'failure' || needs.stage-5-build.result   == 'cancelled'
+        run: |
+          echo "::error title=CI Gate::A pipeline stage failed to complete (infrastructure or setup error, not a scan finding). Merge blocked — open the failed stage's job log."
+          exit 1
+
+      - name: Download stage reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pr-*-${{ github.run_id }}
+          merge-multiple: true
+          path: reports
+
+      - name: Report & gate decision
+        uses: ./.github/actions/ci-gate
+        with:
+          pr_number:       ${{ github.event.pull_request.number }}
+          head_ref:        ${{ github.head_ref }}
+          stage2_ran:      ${{ needs.stage-2-deps.result != 'skipped' }}
+          stage3_ran:      ${{ needs.stage-3-static.result != 'skipped' }}
+          stage4_ran:      ${{ needs.stage-4-tests.result != 'skipped' }}
+          stage5_ran:      ${{ needs.stage-5-build.result != 'skipped' }}
+          secrets:         ${{ needs.stage-1-secrets.outputs.findings }}
+          dep_critical:    ${{ needs.stage-2-deps.outputs.critical }}
+          dep_warnings:    ${{ needs.stage-2-deps.outputs.warnings }}
+          trivy_critical:  ${{ needs.stage-2-deps.outputs.trivy_critical }}
+          trivy_warnings:  ${{ needs.stage-2-deps.outputs.trivy_warnings }}
+          static_critical: ${{ needs.stage-3-static.outputs.critical }}
+          static_warnings: ${{ needs.stage-3-static.outputs.warnings }}
+          eslint_errors:   ${{ needs.stage-3-static.outputs.eslint_errors }}
+          ts_errors:       ${{ needs.stage-3-static.outputs.ts_errors }}
+          tests_passed:    ${{ needs.stage-4-tests.outputs.tests_passed }}
+          test_failures:   ${{ needs.stage-4-tests.outputs.test_failures }}
+          skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
+          build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
