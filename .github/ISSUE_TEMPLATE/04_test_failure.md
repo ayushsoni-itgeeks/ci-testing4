@@ -9,10 +9,7 @@ labels: ["ci-failure", "tests"]
 One or more Vitest unit tests failed.
 
 ## Details
-- Test file / line:
 - Test name:
+- Test file / line:
 - Error:
-
-## How to fix
-- Reproduce with `npx vitest run`.
-- Fix the code or the test, then confirm all tests pass.
+- Commit:
