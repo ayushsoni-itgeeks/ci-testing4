@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: CI pipeline reference
+    url: https://github.com/ayushsoni-itgeeks/ci-testing4/blob/main/.github/workflows/pr-to-main.yml
+    about: How the PR-to-main CI gate evaluates each stage (secrets, dependencies, static analysis, tests, build).
