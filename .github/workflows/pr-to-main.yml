@@ -215,8 +215,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      blocked: ${{ steps.gate.outputs.blocked }}
-      reasons: ${{ steps.gate.outputs.reasons }}
+      blocked:    ${{ steps.gate.outputs.blocked }}
+      reasons:    ${{ steps.gate.outputs.reasons }}
+      categories: ${{ steps.gate.outputs.categories }}
     steps:
       - uses: actions/checkout@v4
 
@@ -266,6 +267,133 @@ jobs:
           skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
           build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
 
+      # Parse the downloaded stage reports into a detailed, professional findings
+      # document (file / line / column / commit / message per finding). This file
+      # becomes the body of the auto-filed GitHub issue. Always runs so the body
+      # is available even when the gate decision step fails the job.
+      - name: Build issue findings report
+        if: always()
+        shell: bash
+        env:
+          R:            reports
+          SECRETS:      ${{ needs.stage-1-secrets.outputs.findings }}
+          DEP_CRITICAL: ${{ needs.stage-2-deps.outputs.critical }}
+          TRIVY_CRIT:   ${{ needs.stage-2-deps.outputs.trivy_critical }}
+          ESLINT_ERR:   ${{ needs.stage-3-static.outputs.eslint_errors }}
+          TS_ERR:       ${{ needs.stage-3-static.outputs.ts_errors }}
+          TESTS_PASSED: ${{ needs.stage-4-tests.outputs.tests_passed }}
+          TEST_FAIL:    ${{ needs.stage-4-tests.outputs.test_failures }}
+          BUILD_OK:     ${{ needs.stage-5-build.outputs.build_ok }}
+        run: |
+          set -uo pipefail
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+
+          OUT="ci-findings.md"
+          : > "$OUT"
+
+          num() { printf '%s' "${1:-0}" | tr -cd '0-9'; }
+          SECRETS=$(num "${SECRETS:-0}");           SECRETS=${SECRETS:-0}
+          DEP_CRITICAL=$(num "${DEP_CRITICAL:-0}"); DEP_CRITICAL=${DEP_CRITICAL:-0}
+          TRIVY_CRIT=$(num "${TRIVY_CRIT:-0}");     TRIVY_CRIT=${TRIVY_CRIT:-0}
+          ESLINT_ERR=$(num "${ESLINT_ERR:-0}");     ESLINT_ERR=${ESLINT_ERR:-0}
+          TS_ERR=$(num "${TS_ERR:-0}");             TS_ERR=${TS_ERR:-0}
+          TEST_FAIL=$(num "${TEST_FAIL:-0}");       TEST_FAIL=${TEST_FAIL:-0}
+          TESTS_PASSED="${TESTS_PASSED:-true}"
+          BUILD_OK="${BUILD_OK:-true}"
+
+          # Stage 1 — Secrets and credentials
+          if [ "$SECRETS" -gt 0 ]; then
+            { echo "### Stage 1 — Secrets and credentials"; echo ""; echo "Total findings: ${SECRETS}."; echo ""; } >> "$OUT"
+            if [ -s "$R/gitleaks-report.json" ] && [ "$(jq 'length' "$R/gitleaks-report.json" 2>/dev/null || echo 0)" -gt 0 ]; then
+              { echo "Secrets detected in git history (Gitleaks):"; echo "";
+                echo "| File | Line | Rule | Commit | Description |"; echo "| --- | ---: | --- | --- | --- |"; } >> "$OUT"
+              jq -r '.[] | "| `" + (.File // "?") + "` | " + ((.StartLine // 1)|tostring) + " | `" + (.RuleID // "?") + "` | `" + ((.Commit // "?")[0:10]) + "` | " + ((.Description // "-")|gsub("[\n|]";" ")) + " |"' \
+                "$R/gitleaks-report.json" 2>/dev/null | head -20 >> "$OUT"
+              echo "" >> "$OUT"
+            fi
+            if [ -s "$R/env-committed.txt" ]; then
+              { echo "Committed environment files:"; echo ""; echo "| File |"; echo "| --- |"; } >> "$OUT"
+              while IFS= read -r f; do [ -z "$f" ] && continue; echo "| \`$f\` |"; done < "$R/env-committed.txt" >> "$OUT"
+              echo "" >> "$OUT"
+            fi
+            if [ -s "$R/private-keys-detail.tsv" ]; then
+              { echo "Private key material:"; echo ""; echo "| File | Commit | Date | Location |"; echo "| --- | --- | --- | --- |"; } >> "$OUT"
+              while IFS=$'\t' read -r f sha date where; do [ -z "$f" ] && continue; echo "| \`$f\` | \`${sha:--}\` | ${date:--} | ${where:--} |"; done < "$R/private-keys-detail.tsv" | head -20 >> "$OUT"
+              echo "" >> "$OUT"
+            fi
+          fi
+
+          # Stage 2 — npm audit
+          if [ "$DEP_CRITICAL" -gt 0 ] && [ -s "$R/npm-audit.json" ]; then
+            { echo "### Stage 2 — Dependency vulnerabilities (npm audit)"; echo ""; echo "Critical/high advisories: ${DEP_CRITICAL}."; echo "";
+              echo "| Package | Severity | Vulnerable range | Fix version | Advisory |"; echo "| --- | --- | --- | --- | --- |"; } >> "$OUT"
+            jq -r '.vulnerabilities // {} | to_entries[] | select(.value.severity=="critical" or .value.severity=="high") | "| `" + .key + "` | " + .value.severity + " | `" + ((.value.range // "?")|gsub("[\n|]";" ")) + "` | " + ((.value.fixAvailable.version // .value.fixAvailable // "no fix")|tostring) + " | " + (((.value.via // []) | map(select(type=="object") | (.title // .url // "advisory")) | join(", "))|gsub("[\n|]";" ")) + " |"' \
+              "$R/npm-audit.json" 2>/dev/null | head -30 >> "$OUT"
+            echo "" >> "$OUT"
+          fi
+
+          # Stage 2 — Trivy
+          if [ "$TRIVY_CRIT" -gt 0 ] && [ -s "$R/trivy-report.json" ]; then
+            { echo "### Stage 2 — Filesystem vulnerabilities (Trivy)"; echo ""; echo "Critical/high findings: ${TRIVY_CRIT}."; echo "";
+              echo "| Target | Vulnerability | Severity | Package | Installed | Fix version |"; echo "| --- | --- | --- | --- | --- | --- |"; } >> "$OUT"
+            jq -r '.Results[]? | .Target as $t | .Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | "| `" + $t + "` | " + (.VulnerabilityID // "?") + " | " + .Severity + " | `" + (.PkgName // "?") + "` | " + (.InstalledVersion // "?") + " | " + (.FixedVersion // "no fix") + " |"' \
+              "$R/trivy-report.json" 2>/dev/null | head -30 >> "$OUT"
+            echo "" >> "$OUT"
+          fi
+
+          # Stage 3 — ESLint
+          if [ "$ESLINT_ERR" -gt 0 ] && [ -s "$R/eslint-report.json" ]; then
+            { echo "### Stage 3 — ESLint errors"; echo ""; echo "Blocking errors: ${ESLINT_ERR}."; echo "";
+              echo "| File | Line | Column | Rule | Message |"; echo "| --- | ---: | ---: | --- | --- |"; } >> "$OUT"
+            jq -r '.[] | .filePath as $p | .messages[] | select(.severity==2) | "| `" + ($p | ltrimstr(env.GITHUB_WORKSPACE + "/")) + "` | " + ((.line // 1)|tostring) + " | " + ((.column // 1)|tostring) + " | `" + (.ruleId // "-") + "` | " + ((.message // "-")|gsub("[\n|]";" ")) + " |"' \
+              "$R/eslint-report.json" 2>/dev/null | head -50 >> "$OUT"
+            echo "" >> "$OUT"
+          fi
+
+          # Stage 3 — TypeScript
+          if [ "$TS_ERR" -gt 0 ] && [ -s "$R/tsc.log" ]; then
+            { echo "### Stage 3 — TypeScript errors"; echo ""; echo "Blocking errors: ${TS_ERR}."; echo "";
+              echo "| File | Line | Column | Code | Message |"; echo "| --- | ---: | ---: | --- | --- |"; } >> "$OUT"
+            grep -E '^.*\([0-9]+,[0-9]+\): error TS' "$R/tsc.log" 2>/dev/null | sed 's/\r//' | head -30 | while IFS= read -r ln; do
+              file=$(printf '%s' "$ln" | sed 's/(\([0-9]*\),\([0-9]*\)).*//'); file="${file#./}"
+              line=$(printf '%s' "$ln" | grep -oP '(?<=\()\d+(?=,)'); col=$(printf '%s' "$ln" | grep -oP '(?<=,)\d+(?=\))')
+              code=$(printf '%s' "$ln" | grep -oP 'TS\d+'); msg=$(printf '%s' "$ln" | sed 's/.*): //' | tr '|' ' ')
+              echo "| \`$file\` | ${line:-1} | ${col:-1} | $code | $msg |"
+            done >> "$OUT"
+            echo "" >> "$OUT"
+          fi
+
+          # Stage 4 — Vitest
+          if [ "$TESTS_PASSED" = "false" ] && [ -s "$R/vitest-results.json" ]; then
+            { echo "### Stage 4 — Failing unit tests (Vitest)"; echo ""; echo "Failing tests: ${TEST_FAIL}."; echo "";
+              echo "| File | Line | Suite | Test | Error |"; echo "| --- | ---: | --- | --- | --- |"; } >> "$OUT"
+            jq -r '.testResults[]? | .testFilePath as $f | .assertionResults[]? | select(.status=="failed") | "| `" + ($f | ltrimstr(env.GITHUB_WORKSPACE + "/")) + "` | " + ((.location.line // 1)|tostring) + " | " + ((.ancestorTitles[-1]) // "-") + " | " + (.title|gsub("[\n|]";" ")) + " | " + (((.failureMessages // []) | .[0] // "-") | gsub("[\n|]";" ") | .[0:160]) + " |"' \
+              "$R/vitest-results.json" 2>/dev/null | head -30 >> "$OUT"
+            echo "" >> "$OUT"
+          fi
+
+          # Stage 5 — Build
+          if [ "$BUILD_OK" = "false" ]; then
+            { echo "### Stage 5 — Production build failure"; echo ""; echo "The production build command failed. Last lines of the build log:"; echo ""; echo '```'; } >> "$OUT"
+            if [ -s "$R/build.log" ]; then grep -E '(error|Error|ERROR)' "$R/build.log" 2>/dev/null | grep -v '^npm warn' | tail -40 | sed 's/\r//' >> "$OUT" || true; else echo "(build.log not available)" >> "$OUT"; fi
+            { echo '```'; echo ""; } >> "$OUT"
+          fi
+
+          if [ ! -s "$OUT" ]; then
+            echo "No detailed findings were captured. See the workflow run logs and the Annotations tab on the pull request." > "$OUT"
+          fi
+
+          echo "----- ci-findings.md -----"; cat "$OUT"
+
+      - name: Upload issue findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-issue-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ci-findings.md
+
   # Auto-file a GitHub Issue when the gate blocks the PR.
   # One issue per PR: updated on each failing re-push and auto-closed once the
   # pipeline passes (deduped via a hidden marker in the issue body).
@@ -283,81 +411,128 @@ jobs:
       issues: write
       contents: read
     steps:
+      - name: Download issue findings
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-issue-${{ github.run_id }}
+          path: ci-issue
+
       - name: File or resolve the CI-failure issue
         uses: actions/github-script@v7
         env:
           BLOCKED:     ${{ needs.gate.outputs.blocked }}
           REASONS:     ${{ needs.gate.outputs.reasons }}
+          CATEGORIES:  ${{ needs.gate.outputs.categories }}
           GATE_RESULT: ${{ needs.gate.result }}
         with:
           script: |
+            const fs = require('fs');
             const { owner, repo } = context.repo;
-            const pr       = context.payload.pull_request;
-            const prNumber = pr.number;
-            const headRef  = pr.head.ref;
-            const sha7     = pr.head.sha.substring(0, 7);
-            const runUrl   = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const marker   = `<!-- ci-gate:pr-${prNumber} -->`;
-            const label    = 'ci-failure';
+            const pr        = context.payload.pull_request;
+            const prNumber  = pr.number;
+            const headRef   = pr.head.ref;
+            const sha7      = pr.head.sha.substring(0, 7);
+            const runUrl    = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const marker    = `<!-- ci-gate:pr-${prNumber} -->`;
+            const baseLabel = 'ci-failure';
 
             const blocked    = process.env.BLOCKED === 'true';
             const gateFailed = process.env.GATE_RESULT === 'failure';
             const reasons    = (process.env.REASONS || '').trim();
+            const categories = (process.env.CATEGORIES || '').split(/\s+/).filter(Boolean);
             const failing    = blocked || gateFailed;
 
-            // Find an existing OPEN ci-failure issue for this PR (matched by the
-            // hidden marker so we keep exactly one issue per PR).
+            // Detailed findings produced by the gate job (downloaded artifact).
+            let findings = '';
+            try { findings = fs.readFileSync('ci-issue/ci-findings.md', 'utf8').trim(); } catch (e) { /* fall back below */ }
+
+            // Labels to apply, created on demand if missing.
+            const labelMeta = {
+              'ci-failure':      { color: 'd73a49', description: 'Automated: CI gate blocked a pull request' },
+              'security':        { color: 'b60205', description: 'Security-related finding' },
+              'secrets':         { color: 'b60205', description: 'Secret or credential finding' },
+              'dependencies':    { color: '0366d6', description: 'Dependency vulnerability' },
+              'static-analysis': { color: '5319e7', description: 'ESLint or TypeScript error' },
+              'tests':           { color: 'fbca04', description: 'Failing unit test' },
+              'build':           { color: 'e99695', description: 'Production build failure' },
+            };
+            const wanted = [baseLabel, ...categories];
+            if (categories.includes('secrets')) wanted.push('security');
+            const labels = [...new Set(wanted)];
+
+            async function ensureLabel(name) {
+              try { await github.rest.issues.getLabel({ owner, repo, name }); }
+              catch (e) {
+                if (e.status === 404) {
+                  const meta = labelMeta[name] || { color: 'ededed', description: '' };
+                  try { await github.rest.issues.createLabel({ owner, repo, name, color: meta.color, description: meta.description }); }
+                  catch (err) { if (err.status !== 422) throw err; }
+                } else { throw e; }
+              }
+            }
+
+            // Find an existing OPEN issue for this PR (matched by the hidden marker).
             const items = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', labels: label, per_page: 100,
+              owner, repo, state: 'open', labels: baseLabel, per_page: 100,
             });
             const existing = items.find(i => !i.pull_request && (i.body || '').includes(marker));
 
             if (failing) {
-              // Ensure the label exists before we try to apply it.
-              try {
-                await github.rest.issues.getLabel({ owner, repo, name: label });
-              } catch (e) {
-                if (e.status === 404) {
-                  await github.rest.issues.createLabel({
-                    owner, repo, name: label, color: 'd73a49',
-                    description: 'Auto-filed by the CI gate when a PR to main fails',
-                  });
-                } else { throw e; }
-              }
+              for (const name of labels) await ensureLabel(name);
 
-              const title    = `🚨 CI failed on PR #${prNumber}: ${headRef} → main`;
-              const findings = (blocked && reasons)
-                ? reasons
-                : '- ⚙️ A pipeline stage failed to complete (infrastructure/setup error). Open the run log.';
+              const title  = `CI failure on PR #${prNumber}: ${headRef} into main`;
+              const detail = (findings && findings.length)
+                ? findings
+                : (reasons || '- A pipeline stage failed to complete (infrastructure or setup error). Open the workflow run log.');
+
               const body = [
-                `**Pipeline:** PR to main`,
-                `**Branch:** \`${headRef}\` → \`main\``,
-                `**Commit:** \`${sha7}\``,
-                `**Run:** ${runUrl}`,
-                `**Pull request:** #${prNumber}`,
+                `## Continuous integration failure`,
                 ``,
-                `The CI gate **blocked** PR #${prNumber}. Fix the items below and re-push to the branch.`,
+                `The automated CI gate blocked this pull request. The findings below must be resolved on the source branch before the pull request can be merged.`,
                 ``,
-                `### Blocking findings`,
-                findings,
+                `| Field | Value |`,
+                `| --- | --- |`,
+                `| Pull request | #${prNumber} |`,
+                `| Source branch | \`${headRef}\` |`,
+                `| Target branch | \`main\` |`,
+                `| Commit | \`${sha7}\` |`,
+                `| Workflow run | [run #${context.runId}](${runUrl}) |`,
+                ``,
+                `## Findings`,
+                ``,
+                detail,
+                ``,
+                `## How to resolve`,
+                ``,
+                `1. Review each finding above. The same errors are also shown inline on the pull request diff via the Annotations tab.`,
+                `2. Fix every blocking item on the \`${headRef}\` branch.`,
+                `3. Push the changes. The pipeline re-runs automatically and this issue is updated with the latest results.`,
+                `4. When the pipeline passes, this issue is closed automatically.`,
+                ``,
+                `## Reference`,
+                ``,
+                `- Workflow run logs: ${runUrl}`,
+                `- CI gate definition: \`.github/workflows/pr-to-main.yml\``,
                 ``,
                 `---`,
-                `<sub>Auto-filed by the CI gate. This issue updates on each failing push and closes automatically once the pipeline passes.</sub>`,
+                `<sub>Filed automatically by the CI gate. Updated on each failing push and closed automatically when the pipeline passes. Do not remove the marker below.</sub>`,
                 ``,
                 marker,
               ].join('\n');
 
               if (existing) {
                 await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body });
+                try { await github.rest.issues.addLabels({ owner, repo, issue_number: existing.number, labels }); } catch (e) { /* non-fatal */ }
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: existing.number,
-                  body: `🔁 Still failing on \`${sha7}\` — [run #${context.runId}](${runUrl}).`,
+                  body: `Still failing on commit \`${sha7}\`. See [run #${context.runId}](${runUrl}).`,
                 });
                 core.notice(`Updated CI-failure issue #${existing.number}`);
               } else {
                 const created = await github.rest.issues.create({
                   owner, repo, title, body,
-                  labels: [label],
+                  labels,
                   assignees: pr.user ? [pr.user.login] : [],
                 });
                 core.notice(`Opened CI-failure issue #${created.data.number}`);
@@ -367,7 +542,7 @@ jobs:
               if (existing) {
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: existing.number,
-                  body: `✅ CI now passing on \`${sha7}\` — [run #${context.runId}](${runUrl}). Auto-closing.`,
+                  body: `The pipeline is now passing on commit \`${sha7}\` ([run #${context.runId}](${runUrl})). Closing this issue automatically.`,
                 });
                 await github.rest.issues.update({
                   owner, repo, issue_number: existing.number,
@@ -375,6 +550,6 @@ jobs:
                 });
                 core.notice(`Closed CI-failure issue #${existing.number}`);
               } else {
-                core.info('No blocking findings and no open CI-failure issue — nothing to do.');
+                core.info('No blocking findings and no open CI-failure issue. Nothing to do.');
               }
             }
