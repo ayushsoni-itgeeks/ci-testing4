@@ -9,11 +9,6 @@ labels: ["ci-failure", "secrets"]
 The secret scan found a credential in the code or git history.
 
 ## Details
+- Type (API key, token, .env, private key):
 - File / line:
 - Commit:
-- Type (API key, token, .env, private key):
-
-## How to fix
-- Remove the secret from the working tree and git history.
-- Rotate the exposed credential.
-- Add the file to `.gitignore`.

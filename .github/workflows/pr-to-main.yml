@@ -267,11 +267,12 @@ jobs:
           skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
           build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
 
-      # Parse the downloaded stage reports into a detailed, professional findings
-      # document (file / line / column / commit / message per finding). This file
-      # becomes the body of the auto-filed GitHub issue. Always runs so the body
-      # is available even when the gate decision step fails the job.
-      - name: Build issue findings report
+      # Parse the downloaded stage reports into a detailed findings document
+      # (file / line / column / commit / message per finding). This feeds both
+      # the final job summary and the auto-filed GitHub issue. Always runs so the
+      # report is available even when the gate decision step fails the job.
+      # (This only assembles a report — it does NOT run the production build.)
+      - name: Collect detailed findings (final summary + issue)
         if: always()
         shell: bash
         env:
@@ -377,6 +378,12 @@ jobs:
             { echo "### Stage 5 — Production build failure"; echo ""; echo "The production build command failed. Last lines of the build log:"; echo ""; echo '```'; } >> "$OUT"
             if [ -s "$R/build.log" ]; then grep -E '(error|Error|ERROR)' "$R/build.log" 2>/dev/null | grep -v '^npm warn' | tail -40 | sed 's/\r//' >> "$OUT" || true; else echo "(build.log not available)" >> "$OUT"; fi
             { echo '```'; echo ""; } >> "$OUT"
+          fi
+
+          # Mirror the detailed findings into the final job summary (the "last
+          # summary"), so the problem type, commit and line are all visible there.
+          if grep -q '^### Stage' "$OUT" 2>/dev/null; then
+            { echo ""; echo "## Detailed findings (problem · commit · line)"; echo ""; cat "$OUT"; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ ! -s "$OUT" ]; then
@@ -487,36 +494,18 @@ jobs:
                 : (reasons || '- A pipeline stage failed to complete (infrastructure or setup error). Open the workflow run log.');
 
               const body = [
-                `## Continuous integration failure`,
-                ``,
-                `The automated CI gate blocked this pull request. The findings below must be resolved on the source branch before the pull request can be merged.`,
+                `## CI failure`,
                 ``,
                 `| Field | Value |`,
                 `| --- | --- |`,
                 `| Pull request | #${prNumber} |`,
-                `| Source branch | \`${headRef}\` |`,
-                `| Target branch | \`main\` |`,
+                `| Branch | \`${headRef}\` into \`main\` |`,
                 `| Commit | \`${sha7}\` |`,
                 `| Workflow run | [run #${context.runId}](${runUrl}) |`,
                 ``,
-                `## Findings`,
+                `## Findings (problem · commit · line)`,
                 ``,
                 detail,
-                ``,
-                `## How to resolve`,
-                ``,
-                `1. Review each finding above. The same errors are also shown inline on the pull request diff via the Annotations tab.`,
-                `2. Fix every blocking item on the \`${headRef}\` branch.`,
-                `3. Push the changes. The pipeline re-runs automatically and this issue is updated with the latest results.`,
-                `4. When the pipeline passes, this issue is closed automatically.`,
-                ``,
-                `## Reference`,
-                ``,
-                `- Workflow run logs: ${runUrl}`,
-                `- CI gate definition: \`.github/workflows/pr-to-main.yml\``,
-                ``,
-                `---`,
-                `<sub>Filed automatically by the CI gate. Updated on each failing push and closed automatically when the pipeline passes. Do not remove the marker below.</sub>`,
                 ``,
                 marker,
               ].join('\n');

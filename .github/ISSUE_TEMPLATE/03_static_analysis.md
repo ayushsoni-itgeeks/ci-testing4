@@ -9,10 +9,7 @@ labels: ["ci-failure", "static-analysis"]
 ESLint or TypeScript reported a blocking error.
 
 ## Details
-- File / line / column:
 - Rule or error code:
+- File / line / column:
 - Message:
-
-## How to fix
-- Fix the error at the reported location.
-- Run `npx eslint .` and `npx tsc --noEmit` locally to confirm.
+- Commit:
