@@ -78,6 +78,10 @@ inputs:
     description: "'true' if the production build succeeded (or did not run)."
     required: false
     default: "true"
+  test_category:
+    description: "Issue label/category for a test failure: 'tests' (unit) or 'smoke'."
+    required: false
+    default: "tests"
 
   # ── PR context ───────────────────────────────────────────────────────────
   pr_number:
@@ -123,6 +127,7 @@ runs:
         T_PASS="${{ inputs.tests_passed }}";       T_PASS="${T_PASS:-true}"
         T_FAIL="${{ inputs.test_failures }}";      T_FAIL="${T_FAIL:-0}"
         B_OK="${{ inputs.build_ok }}";             B_OK="${B_OK:-true}"
+        T_CAT="${{ inputs.test_category }}";       T_CAT="${T_CAT:-tests}"
 
         BLOCK=0; REASONS=""
         LINES=""
@@ -156,9 +161,9 @@ runs:
           echo "::error title=Stage 3 — TypeScript::${TSE} TypeScript type error(s). See the Annotations tab for inline file:line:col locations."
         fi
         if [ "$T_PASS" != "true" ]; then
-          BLOCK=1; REASONS="${REASONS} test-failures(${T_FAIL});"; add_cat "tests"
-          add_line "Stage 4 — Failing unit tests (Vitest): ${T_FAIL}."
-          echo "::error title=Stage 4 — Vitest::${T_FAIL} test(s) failed. See the Annotations tab for test name + file:line + assertion message."
+          BLOCK=1; REASONS="${REASONS} test-failures(${T_FAIL});"; add_cat "$T_CAT"
+          add_line "Failing ${T_CAT} tests (Vitest): ${T_FAIL}."
+          echo "::error title=Vitest (${T_CAT})::${T_FAIL} ${T_CAT} test(s) failed. See the Annotations tab for test name + file:line + assertion message."
         fi
         if [ "$B_OK" != "true" ]; then
           BLOCK=1; REASONS="${REASONS} build-failed;"; add_cat "build"

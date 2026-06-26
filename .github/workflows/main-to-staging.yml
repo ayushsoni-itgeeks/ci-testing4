@@ -1,10 +1,16 @@
 # CI gate for pull requests promoting main into staging.
-# Five stages run in order (secrets → deps → static → tests → build); the first
-# blocking finding stops the chain and every later stage is skipped. Each stage
-# publishes its OWN report (job summary + inline annotations) in the UI. The
-# final "gate" job does NOT re-report — it only publishes the single required
-# status check ("CI Gate · Main → Staging", required by protect-staging.json) and,
-# on failure, files a GitHub issue with the detailed findings.
+#
+# This is a LEAN promotion gate. The full code-quality suite (static analysis +
+# unit tests) already ran and passed on the feature → main PR, so it is NOT
+# repeated here. Instead, this gate verifies the release candidate is shippable:
+#
+#   Stage 1 secrets → Stage 2 deps → Stage 3 build → Stage 4 smoke
+#
+# The first blocking finding stops the chain and every later stage is skipped.
+# Each stage publishes its OWN report (job summary + inline annotations). The
+# final "gate" job publishes the single required status check
+# ("CI Gate · Main → Staging", required by protect-staging.json) and, on failure,
+# files a GitHub issue with the detailed findings.
 # Edit only the env block below.
 
 name: "Main to staging"
@@ -23,13 +29,17 @@ permissions:
 
 env:
   NODE_VERSION: "20"                                 # match package.json engines.node
-  VITEST_CMD:   "npx vitest run --reporter=verbose --passWithNoTests"  # your test command
+  # Promotion gate runs the SMOKE suite (build-artifact checks), not unit tests —
+  # the unit suite already gated this code on the feature → main PR.
+  VITEST_CMD:   "npx vitest run --project smoke --reporter=verbose --passWithNoTests"
   BUILD_CMD:    "npm run build"                      # your production build command
   USE_PRISMA:   "true"                               # run prisma generate before building
   SKIP_TESTS:   ${{ vars.SKIP_TESTS || 'false' }}    # repo var SKIP_TESTS=true skips stage 4
 
 jobs:
   # Stage 1 — secret scan (Gitleaks, TruffleHog, .env, private keys).
+  # Kept on every gate: the scanners check full git history, so a secret
+  # introduced on ANY branch is caught here too — not only on the PR diff.
   stage-1-secrets:
     name: "Stage 1 · Secrets & Credentials"
     runs-on: ubuntu-latest
@@ -64,6 +74,8 @@ jobs:
           stage: "Stage 1 · Secrets & Credentials"
 
   # Stage 2 — dependency vulns (npm audit + Trivy). Runs only if stage 1 is clean.
+  # Kept on the promotion gate: a cheap lockfile-only audit catches CVEs that were
+  # newly disclosed after the code passed the main gate.
   stage-2-deps:
     name: "Stage 2 · Dependencies & Vulnerabilities"
     needs: stage-1-secrets
@@ -111,126 +123,15 @@ jobs:
         with:
           stage: "Stage 2 · Dependencies & Vulnerabilities"
 
-  # Stage 3 — static analysis (ESLint + tsc + Prettier). Runs only if deps are clean.
-  stage-3-static:
-    name: "Stage 3 · Static Code Analysis"
+  # Stage 3 — production build. Runs only if deps are clean. Produces the
+  # release-candidate artifact and uploads it so the smoke stage can test the
+  # exact bytes that would ship (no rebuild). Catches build-time breakage.
+  stage-3-build:
+    name: "Stage 3 · Production Build"
     needs: stage-2-deps
     if: >
       needs.stage-2-deps.outputs.critical == '0' &&
       needs.stage-2-deps.outputs.trivy_critical == '0'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      critical:        ${{ steps.static.outputs.critical }}
-      warnings:        ${{ steps.static.outputs.warnings }}
-      eslint_errors:   ${{ steps.static.outputs.eslint_errors }}
-      eslint_warnings: ${{ steps.static.outputs.eslint_warnings }}
-      ts_errors:       ${{ steps.static.outputs.ts_errors }}
-      prettier_issues: ${{ steps.static.outputs.prettier_issues }}
-      has_tests:       ${{ steps.detect-tests.outputs.has_tests }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # Decide up front whether Stage 4 should run: if the repo has no Vitest
-      # test files, Stage 4 is skipped entirely (rather than running Vitest,
-      # which errors with "No test files found").
-      - name: Detect test files
-        id: detect-tests
-        shell: bash
-        run: |
-          set -uo pipefail
-          COUNT=$(git ls-files | grep -icE '(^|/)[^/]+\.(test|spec)\.([cm]?[jt]sx?)$|(^|/)__tests__/' || true)
-          COUNT=${COUNT:-0}
-          if [ "$COUNT" -gt 0 ]; then HAS=true; else HAS=false; fi
-          echo "has_tests=$HAS" >> "$GITHUB_OUTPUT"
-          echo "Detected $COUNT test file(s) → has_tests=$HAS"
-
-      - name: Setup Node & install
-        uses: ./.github/actions/setup-node
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Static analysis
-        id: static
-        uses: ./.github/actions/static-analysis
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pr-static-${{ github.run_id }}
-          retention-days: 7
-          if-no-files-found: ignore
-          path: |
-            eslint-report.json
-            eslint.log
-            tsc.log
-            prettier.log
-
-      - name: Report failure
-        if: failure()
-        uses: ./.github/actions/stage-failure
-        with:
-          stage: "Stage 3 · Static Code Analysis"
-
-  # Stage 4 — Vitest. Runs only if static is clean, SKIP_TESTS isn't set, AND the
-  # repo actually contains test files (detected in Stage 3). No tests → skipped.
-  stage-4-tests:
-    name: "Stage 4 · Unit Tests (Vitest)"
-    needs: stage-3-static
-    if: >
-      needs.stage-3-static.outputs.critical == '0' &&
-      vars.SKIP_TESTS != 'true' &&
-      needs.stage-3-static.outputs.has_tests == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      tests_passed:  ${{ steps.tests.outputs.tests_passed }}
-      test_failures: ${{ steps.tests.outputs.test_failures }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node & install
-        uses: ./.github/actions/setup-node
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Run Vitest
-        id: tests
-        uses: ./.github/actions/run-tests
-        with:
-          vitest-cmd: ${{ env.VITEST_CMD }}
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pr-tests-${{ github.run_id }}
-          retention-days: 7
-          if-no-files-found: ignore
-          path: |
-            vitest-results.json
-            vitest.log
-
-      - name: Report failure
-        if: failure()
-        uses: ./.github/actions/stage-failure
-        with:
-          stage: "Stage 4 · Unit Tests (Vitest)"
-
-  # Stage 5 — production build. Runs only when every earlier stage actually
-  # succeeded: static analysis clean (no critical findings) and the test stage
-  # either passed or was intentionally skipped (SKIP_TESTS). If any earlier
-  # stage failed, crashed, or found a blocking issue, the build is SKIPPED —
-  # the pipeline stops and goes straight to the gate (which files the issue).
-  # Catches build-time breakage tsc --noEmit can't (bundler config, etc.).
-  stage-5-build:
-    name: "Stage 5 · Production Build"
-    needs: [stage-3-static, stage-4-tests]
-    if: >
-      !cancelled() &&
-      needs.stage-3-static.result == 'success' &&
-      needs.stage-3-static.outputs.critical == '0' &&
-      (needs.stage-4-tests.result == 'success' || needs.stage-4-tests.result == 'skipped') &&
-      needs.stage-4-tests.outputs.tests_passed != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -250,6 +151,18 @@ jobs:
           build-cmd:  ${{ env.BUILD_CMD }}
           use-prisma: ${{ env.USE_PRISMA }}
 
+      # Hand the build output to the smoke stage. Named without the `pr-` prefix
+      # so the gate's `pr-*` report download does not pull it in. Short retention —
+      # it is an intra-run handoff, not a debugging artifact.
+      - name: Upload build output
+        if: steps.build.outputs.build_ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildout-${{ github.run_id }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: build
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -262,12 +175,65 @@ jobs:
         if: failure()
         uses: ./.github/actions/stage-failure
         with:
-          stage: "Stage 5 · Production Build"
+          stage: "Stage 3 · Production Build"
+
+  # Stage 4 — build-artifact smoke tests (Vitest `smoke` project). Runs only if
+  # the build succeeded and SKIP_TESTS isn't set. Pulls the Stage 3 build output
+  # and asserts the deployable artifact is sound (server entry + client assets
+  # present and non-empty). `--passWithNoTests` keeps it green if no smoke tests
+  # exist yet. The live deployment is verified separately, post-merge, by
+  # deploy-verify-staging.yml hitting /healthz.
+  stage-4-smoke:
+    name: "Stage 4 · Smoke Tests (Vitest)"
+    needs: stage-3-build
+    if: >
+      needs.stage-3-build.outputs.build_ok == 'true' &&
+      vars.SKIP_TESTS != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      tests_passed:  ${{ steps.smoke.outputs.tests_passed }}
+      test_failures: ${{ steps.smoke.outputs.test_failures }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node & install
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: buildout-${{ github.run_id }}
+          path: build
+
+      - name: Run smoke tests
+        id: smoke
+        uses: ./.github/actions/run-tests
+        with:
+          vitest-cmd: ${{ env.VITEST_CMD }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-tests-${{ github.run_id }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            vitest-results.json
+            vitest.log
+
+      - name: Report failure
+        if: failure()
+        uses: ./.github/actions/stage-failure
+        with:
+          stage: "Stage 4 · Smoke Tests (Vitest)"
 
   # Gate — the single required status check. Aggregates every stage and decides.
   gate:
     name: "CI Gate · Main → Staging"   # must match the check name in protect-staging.json
-    needs: [stage-1-secrets, stage-2-deps, stage-3-static, stage-4-tests, stage-5-build]
+    needs: [stage-1-secrets, stage-2-deps, stage-3-build, stage-4-smoke]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -285,9 +251,8 @@ jobs:
         if: >
           needs.stage-1-secrets.result == 'failure' || needs.stage-1-secrets.result == 'cancelled' ||
           needs.stage-2-deps.result    == 'failure' || needs.stage-2-deps.result    == 'cancelled' ||
-          needs.stage-3-static.result  == 'failure' || needs.stage-3-static.result  == 'cancelled' ||
-          needs.stage-4-tests.result   == 'failure' || needs.stage-4-tests.result   == 'cancelled' ||
-          needs.stage-5-build.result   == 'failure' || needs.stage-5-build.result   == 'cancelled'
+          needs.stage-3-build.result   == 'failure' || needs.stage-3-build.result   == 'cancelled' ||
+          needs.stage-4-smoke.result   == 'failure' || needs.stage-4-smoke.result   == 'cancelled'
         run: |
           echo "::error title=CI Gate::A pipeline stage failed to complete (infrastructure or setup error, not a scan finding). Merge blocked — open the failed stage's job log."
           exit 1
@@ -307,28 +272,22 @@ jobs:
           pr_number:       ${{ github.event.pull_request.number }}
           head_ref:        ${{ github.head_ref }}
           stage2_ran:      ${{ needs.stage-2-deps.result != 'skipped' }}
-          stage3_ran:      ${{ needs.stage-3-static.result != 'skipped' }}
-          stage4_ran:      ${{ needs.stage-4-tests.result != 'skipped' }}
-          stage5_ran:      ${{ needs.stage-5-build.result != 'skipped' }}
+          stage5_ran:      ${{ needs.stage-3-build.result != 'skipped' }}
+          stage4_ran:      ${{ needs.stage-4-smoke.result != 'skipped' }}
           secrets:         ${{ needs.stage-1-secrets.outputs.findings }}
           dep_critical:    ${{ needs.stage-2-deps.outputs.critical }}
           dep_warnings:    ${{ needs.stage-2-deps.outputs.warnings }}
           trivy_critical:  ${{ needs.stage-2-deps.outputs.trivy_critical }}
           trivy_warnings:  ${{ needs.stage-2-deps.outputs.trivy_warnings }}
-          static_critical: ${{ needs.stage-3-static.outputs.critical }}
-          static_warnings: ${{ needs.stage-3-static.outputs.warnings }}
-          eslint_errors:   ${{ needs.stage-3-static.outputs.eslint_errors }}
-          ts_errors:       ${{ needs.stage-3-static.outputs.ts_errors }}
-          tests_passed:    ${{ needs.stage-4-tests.outputs.tests_passed }}
-          test_failures:   ${{ needs.stage-4-tests.outputs.test_failures }}
+          tests_passed:    ${{ needs.stage-4-smoke.outputs.tests_passed }}
+          test_failures:   ${{ needs.stage-4-smoke.outputs.test_failures }}
+          test_category:   "smoke"
           skip_tests:      ${{ vars.SKIP_TESTS || 'false' }}
-          build_ok:        ${{ needs.stage-5-build.outputs.build_ok }}
+          build_ok:        ${{ needs.stage-3-build.outputs.build_ok }}
 
-      # Parse the downloaded stage reports into a detailed findings document
-      # (file / line / column / commit / message per finding) for the auto-filed
-      # GitHub issue ONLY. Always runs so the issue body is available even when
-      # the gate decision step fails the job. This does NOT write a job summary
-      # (each stage already published its own report) and does NOT run the build.
+      # Parse the downloaded stage reports into a detailed findings document for
+      # the auto-filed GitHub issue ONLY. Always runs so the issue body is
+      # available even when the gate decision step fails the job.
       - name: Collect detailed findings (issue body)
         if: always()
         shell: bash
@@ -337,11 +296,9 @@ jobs:
           SECRETS:      ${{ needs.stage-1-secrets.outputs.findings }}
           DEP_CRITICAL: ${{ needs.stage-2-deps.outputs.critical }}
           TRIVY_CRIT:   ${{ needs.stage-2-deps.outputs.trivy_critical }}
-          ESLINT_ERR:   ${{ needs.stage-3-static.outputs.eslint_errors }}
-          TS_ERR:       ${{ needs.stage-3-static.outputs.ts_errors }}
-          TESTS_PASSED: ${{ needs.stage-4-tests.outputs.tests_passed }}
-          TEST_FAIL:    ${{ needs.stage-4-tests.outputs.test_failures }}
-          BUILD_OK:     ${{ needs.stage-5-build.outputs.build_ok }}
+          TESTS_PASSED: ${{ needs.stage-4-smoke.outputs.tests_passed }}
+          TEST_FAIL:    ${{ needs.stage-4-smoke.outputs.test_failures }}
+          BUILD_OK:     ${{ needs.stage-3-build.outputs.build_ok }}
         run: |
           set -uo pipefail
           command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
@@ -353,8 +310,6 @@ jobs:
           SECRETS=$(num "${SECRETS:-0}");           SECRETS=${SECRETS:-0}
           DEP_CRITICAL=$(num "${DEP_CRITICAL:-0}"); DEP_CRITICAL=${DEP_CRITICAL:-0}
           TRIVY_CRIT=$(num "${TRIVY_CRIT:-0}");     TRIVY_CRIT=${TRIVY_CRIT:-0}
-          ESLINT_ERR=$(num "${ESLINT_ERR:-0}");     ESLINT_ERR=${ESLINT_ERR:-0}
-          TS_ERR=$(num "${TS_ERR:-0}");             TS_ERR=${TS_ERR:-0}
           TEST_FAIL=$(num "${TEST_FAIL:-0}");       TEST_FAIL=${TEST_FAIL:-0}
           TESTS_PASSED="${TESTS_PASSED:-true}"
           BUILD_OK="${BUILD_OK:-true}"
@@ -399,47 +354,21 @@ jobs:
             echo "" >> "$OUT"
           fi
 
-          # Stage 3 — ESLint
-          if [ "$ESLINT_ERR" -gt 0 ] && [ -s "$R/eslint-report.json" ]; then
-            { echo "### Stage 3 — ESLint errors"; echo ""; echo "Blocking errors: ${ESLINT_ERR}."; echo "";
-              echo "| File | Line | Column | Rule | Message |"; echo "| --- | ---: | ---: | --- | --- |"; } >> "$OUT"
-            jq -r '.[] | .filePath as $p | .messages[] | select(.severity==2) | "| `" + ($p | ltrimstr(env.GITHUB_WORKSPACE + "/")) + "` | " + ((.line // 1)|tostring) + " | " + ((.column // 1)|tostring) + " | `" + (.ruleId // "-") + "` | " + ((.message // "-")|gsub("[\n|]";" ")) + " |"' \
-              "$R/eslint-report.json" 2>/dev/null | head -50 >> "$OUT"
-            echo "" >> "$OUT"
-          fi
-
-          # Stage 3 — TypeScript
-          if [ "$TS_ERR" -gt 0 ] && [ -s "$R/tsc.log" ]; then
-            { echo "### Stage 3 — TypeScript errors"; echo ""; echo "Blocking errors: ${TS_ERR}."; echo "";
-              echo "| File | Line | Column | Code | Message |"; echo "| --- | ---: | ---: | --- | --- |"; } >> "$OUT"
-            grep -E '^.*\([0-9]+,[0-9]+\): error TS' "$R/tsc.log" 2>/dev/null | sed 's/\r//' | head -30 | while IFS= read -r ln; do
-              file=$(printf '%s' "$ln" | sed 's/(\([0-9]*\),\([0-9]*\)).*//'); file="${file#./}"
-              line=$(printf '%s' "$ln" | grep -oP '(?<=\()\d+(?=,)'); col=$(printf '%s' "$ln" | grep -oP '(?<=,)\d+(?=\))')
-              code=$(printf '%s' "$ln" | grep -oP 'TS\d+'); msg=$(printf '%s' "$ln" | sed 's/.*): //' | tr '|' ' ')
-              echo "| \`$file\` | ${line:-1} | ${col:-1} | $code | $msg |"
-            done >> "$OUT"
-            echo "" >> "$OUT"
-          fi
-
-          # Stage 4 — Vitest
+          # Stage 4 — Smoke tests (Vitest)
           if [ "$TESTS_PASSED" = "false" ] && [ -s "$R/vitest-results.json" ]; then
-            { echo "### Stage 4 — Failing unit tests (Vitest)"; echo ""; echo "Failing tests: ${TEST_FAIL}."; echo "";
+            { echo "### Stage 4 — Failing smoke tests (Vitest)"; echo ""; echo "Failing tests: ${TEST_FAIL}."; echo "";
               echo "| File | Line | Suite | Test | Error |"; echo "| --- | ---: | --- | --- | --- |"; } >> "$OUT"
             jq -r '.testResults[]? | .testFilePath as $f | .assertionResults[]? | select(.status=="failed") | "| `" + ($f | ltrimstr(env.GITHUB_WORKSPACE + "/")) + "` | " + ((.location.line // 1)|tostring) + " | " + ((.ancestorTitles[-1]) // "-") + " | " + (.title|gsub("[\n|]";" ")) + " | " + (((.failureMessages // []) | .[0] // "-") | gsub("[\n|]";" ") | .[0:160]) + " |"' \
               "$R/vitest-results.json" 2>/dev/null | head -30 >> "$OUT"
             echo "" >> "$OUT"
           fi
 
-          # Stage 5 — Build
+          # Stage 3 — Build
           if [ "$BUILD_OK" = "false" ]; then
-            { echo "### Stage 5 — Production build failure"; echo ""; echo "The production build command failed. Last lines of the build log:"; echo ""; echo '```'; } >> "$OUT"
+            { echo "### Stage 3 — Production build failure"; echo ""; echo "The production build command failed. Last lines of the build log:"; echo ""; echo '```'; } >> "$OUT"
             if [ -s "$R/build.log" ]; then grep -E '(error|Error|ERROR)' "$R/build.log" 2>/dev/null | grep -v '^npm warn' | tail -40 | sed 's/\r//' >> "$OUT" || true; else echo "(build.log not available)" >> "$OUT"; fi
             { echo '```'; echo ""; } >> "$OUT"
           fi
-
-          # NOTE: the detailed findings are intentionally NOT mirrored into the
-          # job summary — each stage already published its own report in the UI,
-          # and the gate must not duplicate it. This document feeds the issue only.
 
           if [ ! -s "$OUT" ]; then
             echo "No detailed findings were captured. See the workflow run logs and the Annotations tab on the pull request." > "$OUT"
@@ -517,7 +446,9 @@ jobs:
               'dependencies':    { color: '0366d6', description: 'Dependency vulnerability' },
               'static-analysis': { color: '5319e7', description: 'ESLint or TypeScript error' },
               'tests':           { color: 'fbca04', description: 'Failing unit test' },
+              'smoke':           { color: 'fbca04', description: 'Failing smoke test' },
               'build':           { color: 'e99695', description: 'Production build failure' },
+              'deploy':          { color: '1d76db', description: 'Deployment verification failure' },
             };
             const wanted = [baseLabel, ...categories];
             if (categories.includes('secrets')) wanted.push('security');

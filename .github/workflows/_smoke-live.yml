@@ -1,0 +1,233 @@
+# Reusable post-deploy live smoke verification.
+#
+# Called AFTER a promotion merges and DigitalOcean has (auto-)deployed the branch
+# (staging → preview, production → live site). It:
+#   1. waits for the deployment's /healthz to return 200 (absorbs deploy lag),
+#   2. runs the Vitest live smoke test against the real URL, and
+#   3. files / resolves a GitHub issue (labels: deploy, smoke) on the result.
+#
+# It is NOT a merge gate (the merge already happened) — it is a deployment alarm.
+# If the deployment URL variable is unset, it no-ops with a warning.
+
+name: "Live smoke (reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (staging | production); used in logs and the issue marker."
+        required: true
+        type: string
+      url:
+        description: "Base URL of the deployed app. Pass the repo variable; may be empty if unset."
+        required: true
+        type: string
+      health_path:
+        description: "Health endpoint path."
+        required: false
+        default: "/healthz"
+        type: string
+      timeout_seconds:
+        description: "How long to wait for the deployment to become healthy."
+        required: false
+        default: 600
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: live-smoke-${{ inputs.environment }}
+  cancel-in-progress: true
+
+jobs:
+  live-smoke:
+    name: "Live smoke · ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check URL is configured
+        id: cfg
+        shell: bash
+        run: |
+          if [ -z "${{ inputs.url }}" ]; then
+            echo "::warning title=Live smoke skipped::No deployment URL configured for '${{ inputs.environment }}'. Set the repository variable (STAGING_URL / PRODUCTION_URL) to enable post-deploy verification."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.proceed == 'true'
+
+      - name: Setup Node & install
+        if: steps.cfg.outputs.proceed == 'true'
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: "20"
+
+      - name: Wait for deployment to become healthy
+        id: health
+        if: steps.cfg.outputs.proceed == 'true'
+        shell: bash
+        env:
+          BASE: ${{ inputs.url }}
+          HP: ${{ inputs.health_path }}
+          TIMEOUT: ${{ inputs.timeout_seconds }}
+        run: |
+          set -uo pipefail
+          URL="${BASE%/}${HP}"
+          echo "Polling $URL for up to ${TIMEOUT}s ..."
+          deadline=$(( $(date +%s) + TIMEOUT ))
+          attempt=0
+          last="000"
+          while :; do
+            attempt=$((attempt + 1))
+            last=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "$URL" || echo "000")
+            echo "attempt ${attempt}: HTTP ${last}"
+            if [ "$last" = "200" ]; then
+              echo "healthy=true" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Deployment healthy::${URL} returned 200 after ${attempt} attempt(s)."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "healthy=false" >> "$GITHUB_OUTPUT"
+              echo "last_code=${last}" >> "$GITHUB_OUTPUT"
+              echo "::error title=Deployment unhealthy::${URL} did not return 200 within ${TIMEOUT}s (last HTTP ${last})."
+              exit 0
+            fi
+            sleep 10
+          done
+
+      - name: Run live smoke test
+        id: smoke
+        if: steps.cfg.outputs.proceed == 'true' && steps.health.outputs.healthy == 'true'
+        shell: bash
+        env:
+          SMOKE_URL: ${{ inputs.url }}
+        run: |
+          set -uo pipefail
+          EXIT=0
+          npx vitest run tests/smoke/live.smoke.test.ts --reporter=verbose 2>&1 | tee smoke.log || EXIT=$?
+          echo "exit=${EXIT}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: File or resolve the deploy-smoke issue
+        if: steps.cfg.outputs.proceed == 'true'
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          URL: ${{ inputs.url }}
+          HEALTHY: ${{ steps.health.outputs.healthy }}
+          LAST_CODE: ${{ steps.health.outputs.last_code }}
+          SMOKE_EXIT: ${{ steps.smoke.outputs.exit }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const env       = process.env.ENVIRONMENT;
+            const url       = process.env.URL;
+            const healthy   = process.env.HEALTHY === 'true';
+            const lastCode  = process.env.LAST_CODE || 'n/a';
+            const smokeExit = process.env.SMOKE_EXIT; // undefined if smoke skipped (unhealthy)
+            const sha7      = (context.sha || '').substring(0, 7);
+            const runUrl    = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const marker    = `<!-- deploy-smoke:${env} -->`;
+            const baseLabel = 'deploy';
+
+            const smokeFailed = healthy && smokeExit !== undefined && smokeExit !== '0';
+            const failing     = !healthy || smokeFailed;
+
+            const labelMeta = {
+              'deploy': { color: '1d76db', description: 'Deployment verification failure' },
+              'smoke':  { color: 'fbca04', description: 'Failing smoke test' },
+            };
+            const labels = [baseLabel, 'smoke'];
+            async function ensureLabel(name) {
+              try { await github.rest.issues.getLabel({ owner, repo, name }); }
+              catch (e) {
+                if (e.status === 404) {
+                  const m = labelMeta[name] || { color: 'ededed', description: '' };
+                  try { await github.rest.issues.createLabel({ owner, repo, name, color: m.color, description: m.description }); }
+                  catch (err) { if (err.status !== 422) throw err; }
+                } else { throw e; }
+              }
+            }
+
+            const items = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: baseLabel, per_page: 100,
+            });
+            const existing = items.find(i => !i.pull_request && (i.body || '').includes(marker));
+
+            if (failing) {
+              for (const name of labels) await ensureLabel(name);
+
+              let detail;
+              if (!healthy) {
+                detail = `The deployment never became healthy: \`GET ${url}/healthz\` did not return 200 (last HTTP \`${lastCode}\`).`;
+              } else {
+                let log = '';
+                try { log = fs.readFileSync('smoke.log', 'utf8'); } catch (e) { /* ignore */ }
+                const tail = log.split('\n').slice(-40).join('\n');
+                detail = `The live smoke test failed against \`${url}\`.\n\n\`\`\`\n${tail}\n\`\`\``;
+              }
+
+              const title = `Deployment smoke failed: ${env}`;
+              const body = [
+                `## Deployment verification failed`,
+                ``,
+                `| Field | Value |`,
+                `| --- | --- |`,
+                `| Environment | \`${env}\` |`,
+                `| URL | ${url} |`,
+                `| Commit | \`${sha7}\` |`,
+                `| Workflow run | [run #${context.runId}](${runUrl}) |`,
+                ``,
+                detail,
+                ``,
+                marker,
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, title, body });
+                try { await github.rest.issues.addLabels({ owner, repo, issue_number: existing.number, labels }); } catch (e) { /* non-fatal */ }
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Still failing on commit \`${sha7}\`. See [run #${context.runId}](${runUrl}).`,
+                });
+                core.notice(`Updated deploy-smoke issue #${existing.number}`);
+              } else {
+                const created = await github.rest.issues.create({ owner, repo, title, body, labels });
+                core.notice(`Opened deploy-smoke issue #${created.data.number}`);
+              }
+            } else {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `\`${env}\` is healthy again on commit \`${sha7}\` ([run #${context.runId}](${runUrl})). Closing automatically.`,
+                });
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed', state_reason: 'completed' });
+                core.notice(`Closed deploy-smoke issue #${existing.number}`);
+              } else {
+                core.info(`'${env}' deployment verified healthy. Nothing to do.`);
+              }
+            }
+
+      - name: Fail the run if the deployment is unhealthy or smoke failed
+        if: steps.cfg.outputs.proceed == 'true'
+        shell: bash
+        env:
+          HEALTHY: ${{ steps.health.outputs.healthy }}
+          SMOKE_EXIT: ${{ steps.smoke.outputs.exit }}
+        run: |
+          set -uo pipefail
+          if [ "${HEALTHY}" != "true" ]; then
+            echo "::error::Deployment did not become healthy — see the auto-filed deploy issue."
+            exit 1
+          fi
+          if [ -n "${SMOKE_EXIT:-}" ] && [ "${SMOKE_EXIT}" != "0" ]; then
+            echo "::error::Live smoke test failed — see the auto-filed deploy issue."
+            exit 1
+          fi
+          echo "✅ ${{ inputs.environment }} deployment verified."

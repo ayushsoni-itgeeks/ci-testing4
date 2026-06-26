@@ -1,0 +1,40 @@
+name: "🧪 Test failure (Stage 4)"
+description: "One or more Vitest unit or smoke tests failed."
+title: "[Tests]: "
+labels: ["ci-failure", "tests"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A Vitest test failed. Unit tests gate the feature → main PR; build-artifact smoke tests gate the staging / production promotions.
+  - type: dropdown
+    id: suite
+    attributes:
+      label: Suite
+      options:
+        - unit
+        - smoke
+    validations:
+      required: true
+  - type: input
+    id: test-name
+    attributes:
+      label: Test name
+      placeholder: "healthPayload > reports an ok status"
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Test file / line
+      placeholder: "tests/unit/health.test.ts:8"
+    validations:
+      required: false
+  - type: textarea
+    id: error
+    attributes:
+      label: Error
+      description: Paste the assertion error and stack trace.
+      render: shell
+    validations:
+      required: false
