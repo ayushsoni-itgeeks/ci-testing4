@@ -1,0 +1,26 @@
+# Post-deploy verification for the STAGING (DigitalOcean preview) environment.
+#
+# Runs on every push to `staging` — i.e. right after a `main → staging` promotion
+# merges and DigitalOcean redeploys the preview. It waits for the preview to come
+# up and runs the live smoke test against it, filing an issue if it is unhealthy.
+#
+# Requires repository variable STAGING_URL (Settings → Secrets and variables →
+# Actions → Variables). If unset, the run no-ops with a warning.
+
+name: "Verify staging deploy"
+
+on:
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  live-smoke:
+    uses: ./.github/workflows/_smoke-live.yml
+    with:
+      environment: staging
+      url: ${{ vars.STAGING_URL }}
+      timeout_seconds: 600

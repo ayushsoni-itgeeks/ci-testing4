@@ -23,7 +23,10 @@ permissions:
 
 env:
   NODE_VERSION: "20"                                 # match package.json engines.node
-  VITEST_CMD:   "npx vitest run --reporter=verbose --passWithNoTests"  # your test command
+  # Feature → main is the full code-quality gate: it runs the UNIT suite only.
+  # Smoke tests are NOT run here — they gate the promotion PRs (main → staging,
+  # staging → production) instead.
+  VITEST_CMD:   "npx vitest run --project unit --reporter=verbose --passWithNoTests"  # your test command
   BUILD_CMD:    "npm run build"                      # your production build command
   USE_PRISMA:   "true"                               # run prisma generate before building
   SKIP_TESTS:   ${{ vars.SKIP_TESTS || 'false' }}    # repo var SKIP_TESTS=true skips stage 4

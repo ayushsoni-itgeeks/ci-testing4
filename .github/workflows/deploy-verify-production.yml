@@ -1,0 +1,27 @@
+# Post-deploy verification for the PRODUCTION (live site) environment.
+#
+# Runs on every push to `production` — i.e. right after a `staging → production`
+# promotion merges and DigitalOcean redeploys the live site. It waits for the
+# site to come up and runs the live smoke test against it, filing an issue if it
+# is unhealthy.
+#
+# Requires repository variable PRODUCTION_URL (Settings → Secrets and variables →
+# Actions → Variables). If unset, the run no-ops with a warning.
+
+name: "Verify production deploy"
+
+on:
+  push:
+    branches: [production]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  live-smoke:
+    uses: ./.github/workflows/_smoke-live.yml
+    with:
+      environment: production
+      url: ${{ vars.PRODUCTION_URL }}
+      timeout_seconds: 600

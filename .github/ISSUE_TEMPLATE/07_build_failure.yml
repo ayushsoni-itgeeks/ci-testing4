@@ -1,0 +1,24 @@
+name: "🏗️ Build failure (Stage 3/5)"
+description: "The production build (react-router build) failed."
+title: "[Build]: "
+labels: ["ci-failure", "build"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The production build did not complete. This catches breakage that `tsc --noEmit` cannot (bundler/config errors, missing modules, etc.).
+  - type: input
+    id: location
+    attributes:
+      label: File / line (if known)
+      placeholder: "app/routes/app.jsx:30"
+    validations:
+      required: false
+  - type: textarea
+    id: error
+    attributes:
+      label: Build log
+      description: Paste the failing portion of the build log.
+      render: shell
+    validations:
+      required: true

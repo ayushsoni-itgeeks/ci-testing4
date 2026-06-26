@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: CI pipeline reference
+  - name: 🔒 Report a security vulnerability privately
+    url: https://github.com/ayushsoni-itgeeks/ci-testing4/security/advisories/new
+    about: Do not open a public issue for security problems — use a private security advisory. See SECURITY.md.
+  - name: 📖 CI/CD pipeline reference
     url: https://github.com/ayushsoni-itgeeks/ci-testing4/blob/main/.github/workflows/pr-to-main.yml
-    about: How the PR-to-main CI gate evaluates each stage (secrets, dependencies, static analysis, tests, build).
+    about: How the gates evaluate each stage (secrets, dependencies, static analysis, tests, build) and how promotions are verified.
