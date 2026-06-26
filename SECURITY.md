@@ -35,4 +35,4 @@ Every pull request runs a CI gate before it can merge:
 - **Static analysis, tests, and build** must pass.
 
 A leaked credential should be treated as compromised: **rotate it immediately**,
-then remove it from history. See `.github/workflows/pr-to-main.yml` for details.
+then remove it from history. See `.github/workflows/pr-to-main.yml` for details..
